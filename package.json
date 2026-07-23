@@ -1,0 +1,22 @@
+{
+  "name": "aplikasi-keuangan-ai",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/server",
+    "apps/client"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev --workspace apps/server\" \"npm run dev --workspace apps/client\"",
+    "dev:server": "npm run dev --workspace apps/server",
+    "dev:client": "npm run dev --workspace apps/client",
+    "build": "npm run build --workspace apps/server && npm run build --workspace apps/client",
+    "test": "npm run test --workspace apps/server",
+    "db:migrate": "npm run db:migrate --workspace apps/server",
+    "db:seed": "npm run db:seed --workspace apps/server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.0"
+  }
+}

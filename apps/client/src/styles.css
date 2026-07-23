@@ -1,0 +1,91 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-primary: #00b817;
+  --color-primary-hover: #009714;
+  --color-primary-dark: #003d12;
+  --color-primary-soft: #e9ffed;
+  color: #172033;
+  background: #f5f7fb;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html {
+  font-size: 14px;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+@media (min-width: 1024px) {
+  html {
+    font-size: 14px;
+  }
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+.focus-ring {
+  @apply focus:outline-none focus:ring-2 focus:ring-sky-500 focus:ring-offset-2;
+}
+
+.input {
+  @apply w-full rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-[13px] text-slate-900 shadow-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 lg:rounded-md lg:px-3 lg:py-2;
+}
+
+.input:focus {
+  border-color: var(--color-primary);
+  --tw-ring-color: rgba(0, 184, 23, 0.16);
+}
+
+.btn-primary {
+  @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-[13px] font-bold text-white shadow-sm transition disabled:cursor-not-allowed disabled:opacity-60 lg:rounded-md lg:py-2;
+  background-color: var(--color-primary);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background-color: var(--color-primary-hover);
+}
+
+.btn-secondary {
+  @apply inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-[13px] font-bold text-slate-700 shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 lg:rounded-md lg:py-2;
+}
+
+.btn-danger {
+  @apply inline-flex items-center justify-center gap-2 rounded-xl bg-rose-600 px-4 py-2.5 text-[13px] font-bold text-white shadow-sm transition hover:bg-rose-700 lg:rounded-md lg:py-2;
+}
+
+.card {
+  @apply rounded-[22px] border border-white/80 bg-white shadow-soft lg:rounded-lg lg:border-slate-200;
+}
+
+.mobile-icon-btn {
+  @apply relative flex h-10 w-10 items-center justify-center rounded-2xl border border-white/80 bg-white text-slate-700 shadow-sm;
+}
+
+.mobile-avatar-btn {
+  @apply flex h-10 w-10 items-center justify-center rounded-2xl bg-gradient-to-br from-amber-100 to-sky-100 text-slate-700 shadow-sm;
+}
+
+@media (max-width: 767px) {
+  body {
+    background:
+      radial-gradient(circle at 10% 0%, rgba(45, 212, 191, 0.14), transparent 28%),
+      radial-gradient(circle at 90% 6%, rgba(139, 92, 246, 0.14), transparent 26%),
+      #f4f8ff;
+  }
+}
