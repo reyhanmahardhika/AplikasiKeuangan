@@ -79,6 +79,9 @@ export async function updateAccount(userId: string, accountId: string, payload: 
   const next = {
     name: payload.name ?? account.name,
     accountType: payload.accountType ?? account.account_type,
+    initialBalance: payload.initialBalance === undefined
+      ? account.initial_balance
+      : normalizeNonNegativeMoney(payload.initialBalance),
     currency: payload.currency ?? account.currency,
     allowNegative: payload.allowNegative ?? account.allow_negative,
     isActive: payload.isActive ?? account.is_active
@@ -86,16 +89,115 @@ export async function updateAccount(userId: string, accountId: string, payload: 
 
   const result = await pool.query(
     `UPDATE accounts
-     SET name = $1, account_type = $2, currency = $3, allow_negative = $4, is_active = $5, updated_at = now()
-     WHERE id = $6 AND user_id = $7
+     SET name = $1, account_type = $2, initial_balance = $3,
+         current_balance = $3::numeric + COALESCE((
+           SELECT sum(
+             CASE
+               WHEN $2 = 'credit_card' AND t.transaction_type = 'expense' THEN t.amount
+               WHEN $2 = 'credit_card' THEN -t.amount
+               WHEN t.transaction_type = 'income' THEN t.amount
+               ELSE -t.amount
+             END
+           )
+           FROM transactions t
+           WHERE t.account_id = accounts.id
+         ), 0),
+         currency = $4, allow_negative = $5, is_active = $6, updated_at = now()
+     WHERE id = $7 AND user_id = $8
      RETURNING id, name, account_type AS "accountType", initial_balance AS "initialBalance",
                current_balance AS "currentBalance", currency, allow_negative AS "allowNegative",
                is_active AS "isActive"`,
-    [next.name, next.accountType, next.currency, next.allowNegative, next.isActive, accountId, userId]
+    [next.name, next.accountType, next.initialBalance, next.currency, next.allowNegative, next.isActive, accountId, userId]
   );
 
   await writeAuditLog(pool, { userId, action: "UPDATE", entityName: "Account", entityId: accountId, previousValue: account, newValue: result.rows[0] });
   return result.rows[0];
+}
+
+export async function resetAccount(userId: string, accountId: string, payload: { initialBalance?: unknown }) {
+  return withDbTransaction(async (client) => {
+    const current = await client.query<AccountRow>(
+      "SELECT * FROM accounts WHERE id = $1 AND user_id = $2 FOR UPDATE",
+      [accountId, userId]
+    );
+    const account = current.rows[0];
+    if (!account) throw notFound("Akun tidak ditemukan");
+
+    const initialBalance = payload.initialBalance === undefined
+      ? account.initial_balance
+      : normalizeNonNegativeMoney(payload.initialBalance);
+
+    const linkedTransfers = await client.query<{
+      id: string;
+      source_transaction_id: string | null;
+      destination_transaction_id: string | null;
+      fee_transaction_id: string | null;
+    }>(
+      `SELECT id, source_transaction_id, destination_transaction_id, fee_transaction_id
+       FROM transfers
+       WHERE user_id = $1 AND (source_account_id = $2 OR destination_account_id = $2)
+       FOR UPDATE`,
+      [userId, accountId]
+    );
+    const linkedTransactionIds = linkedTransfers.rows.flatMap((row) =>
+      [row.source_transaction_id, row.destination_transaction_id, row.fee_transaction_id]
+        .filter((id): id is string => Boolean(id))
+    );
+
+    if (linkedTransfers.rowCount) {
+      await client.query(
+        "DELETE FROM transfers WHERE user_id = $1 AND (source_account_id = $2 OR destination_account_id = $2)",
+        [userId, accountId]
+      );
+    }
+    if (linkedTransactionIds.length) {
+      await client.query(
+        "DELETE FROM transactions WHERE user_id = $1 AND (account_id = $2 OR id = ANY($3::uuid[]))",
+        [userId, accountId, linkedTransactionIds]
+      );
+    } else {
+      await client.query("DELETE FROM transactions WHERE user_id = $1 AND account_id = $2", [userId, accountId]);
+    }
+
+    await client.query(
+      `UPDATE accounts a
+       SET initial_balance = CASE WHEN a.id = $2 THEN $3::numeric ELSE a.initial_balance END,
+           current_balance =
+             CASE WHEN a.id = $2 THEN $3::numeric ELSE a.initial_balance END
+             + COALESCE((
+               SELECT sum(
+                 CASE
+                   WHEN a.account_type = 'credit_card' AND t.transaction_type = 'expense' THEN t.amount
+                   WHEN a.account_type = 'credit_card' THEN -t.amount
+                   WHEN t.transaction_type = 'income' THEN t.amount
+                   ELSE -t.amount
+                 END
+               )
+               FROM transactions t
+               WHERE t.account_id = a.id
+             ), 0),
+           updated_at = now()
+       WHERE a.user_id = $1`,
+      [userId, accountId, initialBalance]
+    );
+
+    const result = await client.query(
+      `SELECT id, name, account_type AS "accountType", initial_balance AS "initialBalance",
+              current_balance AS "currentBalance", currency, allow_negative AS "allowNegative",
+              is_active AS "isActive"
+       FROM accounts WHERE id = $1`,
+      [accountId]
+    );
+    await writeAuditLog(client, {
+      userId,
+      action: "RESET",
+      entityName: "Account",
+      entityId: accountId,
+      previousValue: account,
+      newValue: { ...result.rows[0], deletedTransfers: linkedTransfers.rowCount }
+    });
+    return result.rows[0];
+  });
 }
 
 export async function deleteAccount(userId: string, accountId: string) {

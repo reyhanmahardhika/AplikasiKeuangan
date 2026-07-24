@@ -5,6 +5,7 @@ import {
   ArrowLeftRight,
   ArrowUpRight,
   ArrowUp,
+  Banknote,
   Bell,
   Bot,
   Briefcase,
@@ -23,6 +24,7 @@ import {
   HeartPulse,
   Home,
   LayoutDashboard,
+  Landmark,
   LineChart,
   Loader2,
   LogOut,
@@ -32,6 +34,7 @@ import {
   Settings,
   Sparkles,
   ShoppingBag,
+  Smartphone,
   Store,
   Tags,
   Trash2,
@@ -188,6 +191,7 @@ function successMessageFor(path: string, method: string) {
   if (path === "/transfers" && method === "POST") return "Berhasil transfer saldo";
   if (path.includes("/receipts/") && path.endsWith("/confirm") && method === "POST") return "Berhasil menambah transaksi dari struk";
   if (path === "/accounts" && method === "POST") return "Berhasil menambah akun";
+  if (path.endsWith("/reset") && path.startsWith("/accounts/") && method === "POST") return "Akun berhasil direset";
   if (path.startsWith("/accounts/") && method === "PUT") return "Berhasil mengubah akun";
   if (path === "/categories" && method === "POST") return "Berhasil menambah kategori";
   if (path.startsWith("/categories/") && method === "PUT") return "Berhasil mengubah kategori";
@@ -238,6 +242,7 @@ function App() {
   const [editing, setEditing] = useState<TransactionDetail | null>(null);
   const [selectedTransaction, setSelectedTransaction] = useState<TransactionDetail | null>(null);
   const [historyFocusTransactionId, setHistoryFocusTransactionId] = useState<string | null>(null);
+  const [historyAccountId, setHistoryAccountId] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   const [showScrollTop, setShowScrollTop] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
@@ -375,7 +380,10 @@ function App() {
     return <AuthView onSignedIn={setSession} onInstall={installApp} showInstall={!installedAsApp} />;
   }
 
-  const navigate = (nextView: View) => {
+  const navigate = (nextView: View, preserveHistoryAccount = false) => {
+    if (nextView === "history" && !preserveHistoryAccount) {
+      setHistoryAccountId("");
+    }
     if (nextView === "manual" || view === "manual" || nextView !== "transactionDetail") {
       setEditing(null);
     }
@@ -517,10 +525,12 @@ function App() {
           )}
           {view === "history" && (
             <HistoryView
+              accounts={accounts}
               request={request}
               onOpen={openTransactionDetail}
               onChanged={refreshCore}
               token={token!}
+              initialAccountId={historyAccountId}
               focusTransactionId={historyFocusTransactionId}
               onFocused={() => setHistoryFocusTransactionId(null)}
             />
@@ -531,17 +541,37 @@ function App() {
               token={token!}
               onBack={() => {
                 setHistoryFocusTransactionId(selectedTransaction.id);
-                navigate("history");
+                navigate("history", true);
               }}
               onEdit={startEditingTransaction}
               onDelete={() => removeTransaction(selectedTransaction.id)}
             />
           )}
-          {view === "accounts" && <AccountsView accounts={accounts} request={request} onChanged={refreshCore} />}
+          {view === "accounts" && (
+            <AccountsView
+              accounts={accounts}
+              request={request}
+              onChanged={refreshCore}
+              onOpenTransactions={(accountId) => {
+                setHistoryAccountId(accountId);
+                navigate("history", true);
+              }}
+            />
+          )}
           {view === "categories" && <CategoriesView categories={categories} request={request} onChanged={refreshCore} />}
           {view === "budgets" && <BudgetsView categories={categories} request={request} onChanged={refreshCore} />}
           {view === "manage" && (
-            <ManageView accounts={accounts} categories={categories} request={request} onNavigate={navigate} onChanged={refreshCore} />
+            <ManageView
+              accounts={accounts}
+              categories={categories}
+              request={request}
+              onNavigate={navigate}
+              onChanged={refreshCore}
+              onOpenAccountTransactions={(accountId) => {
+                setHistoryAccountId(accountId);
+                navigate("history", true);
+              }}
+            />
           )}
           {view === "reports" && <ReportsView request={request} />}
           {view === "assistant" && <AssistantView request={request} />}
@@ -2092,23 +2122,28 @@ function ReceiptView({
 }
 
 function HistoryView({
+  accounts,
   request,
   onOpen,
   onChanged,
   token,
+  initialAccountId,
   focusTransactionId,
   onFocused
 }: {
+  accounts: Account[];
   request: <T>(path: string, options?: RequestInit) => Promise<T>;
   onOpen: (id: string) => void;
   onChanged: () => Promise<void>;
   token: string;
+  initialAccountId?: string;
   focusTransactionId?: string | null;
   onFocused?: () => void;
 }) {
   const [rows, setRows] = useState<Transaction[]>([]);
   const [search, setSearch] = useState("");
   const [type, setType] = useState("");
+  const [accountId, setAccountId] = useState(initialAccountId ?? "");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
   const [loading, setLoading] = useState(true);
@@ -2116,11 +2151,12 @@ function HistoryView({
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const transactionRefs = useRef(new Map<string, HTMLDivElement>());
 
-  const load = async (nextSearch = search, nextType = type, nextFromDate = fromDate, nextToDate = toDate) => {
+  const load = async (nextSearch = search, nextType = type, nextFromDate = fromDate, nextToDate = toDate, nextAccountId = accountId) => {
     setLoading(true);
     const params = new URLSearchParams();
     if (nextSearch.trim()) params.set("search", nextSearch.trim());
     if (nextType) params.set("type", nextType);
+    if (nextAccountId) params.set("accountId", nextAccountId);
     if (nextFromDate) params.set("from", dateFilterIso(nextFromDate, "start"));
     if (nextToDate) params.set("to", dateFilterIso(nextToDate, "end"));
     const result = await request<{ data: Transaction[] }>(`/transactions?${params.toString()}`);
@@ -2130,10 +2166,14 @@ function HistoryView({
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      load(search, type, fromDate, toDate).catch(console.error);
+      load(search, type, fromDate, toDate, accountId).catch(console.error);
     }, 300);
     return () => window.clearTimeout(timer);
-  }, [search, type, fromDate, toDate]);
+  }, [search, type, fromDate, toDate, accountId]);
+
+  useEffect(() => {
+    setAccountId(initialAccountId ?? "");
+  }, [initialAccountId]);
 
   useEffect(() => {
     if (loading || !focusTransactionId) return;
@@ -2152,7 +2192,7 @@ function HistoryView({
   const remove = async (id: string) => {
     if (!window.confirm("Hapus transaksi ini?")) return;
     await request(`/transactions/${id}`, { method: "DELETE" });
-    await load(search, type, fromDate, toDate);
+    await load(search, type, fromDate, toDate, accountId);
     await onChanged();
   };
 
@@ -2160,6 +2200,7 @@ function HistoryView({
     const params = new URLSearchParams({ format });
     if (search.trim()) params.set("search", search.trim());
     if (type) params.set("type", type);
+    if (accountId) params.set("accountId", accountId);
     if (fromDate) params.set("from", dateFilterIso(fromDate, "start"));
     if (toDate) params.set("to", dateFilterIso(toDate, "end"));
     const response = await fetch(downloadUrl(`/transactions/export?${params.toString()}`), {
@@ -2220,7 +2261,7 @@ function HistoryView({
     if (!window.confirm(`Hapus ${ids.length} transaksi terpilih?`)) return;
     await Promise.all(ids.map((id) => request(`/transactions/${id}`, { method: "DELETE" })));
     setSelectedIds(new Set());
-    await load(search, type, fromDate, toDate);
+    await load(search, type, fromDate, toDate, accountId);
     await onChanged();
   };
 
@@ -2294,6 +2335,21 @@ function HistoryView({
             </button>
           ))}
         </div>
+
+        <label className="mt-3 block">
+          <span className="mb-1 block text-[10px] font-semibold uppercase text-slate-400">Akun</span>
+          <select
+            className="input"
+            value={accountId}
+            onChange={(event) => setAccountId(event.target.value)}
+            aria-label="Filter berdasarkan akun"
+          >
+            <option value="">Semua akun</option>
+            {accounts.map((account) => (
+              <option key={account.id} value={account.id}>{account.name}</option>
+            ))}
+          </select>
+        </label>
 
         <div className="mt-3 grid grid-cols-2 gap-2">
           <label className="relative block rounded-2xl border border-slate-200 bg-white px-3 py-2 lg:rounded-md">
@@ -2462,6 +2518,17 @@ function accountTypeLabel(type: string) {
   return labels[type] ?? type;
 }
 
+function accountTypeIcon(type: string): LucideIcon {
+  const icons: Record<string, LucideIcon> = {
+    cash: Banknote,
+    bank: Landmark,
+    e_wallet: Smartphone,
+    credit_card: CreditCard,
+    other: Wallet
+  };
+  return icons[type] ?? Wallet;
+}
+
 function budgetTone(status: string) {
   if (status === "Aman") return "bg-emerald-50 text-[#00b817]";
   if (status === "Peringatan") return "bg-amber-50 text-amber-700";
@@ -2485,13 +2552,15 @@ function ManageView({
   categories,
   request,
   onNavigate,
-  onChanged
+  onChanged,
+  onOpenAccountTransactions
 }: {
   accounts: Account[];
   categories: Category[];
   request: <T>(path: string, options?: RequestInit) => Promise<T>;
   onNavigate: (view: View) => void;
   onChanged: () => Promise<void>;
+  onOpenAccountTransactions: (accountId: string) => void;
 }) {
   const [activeTab, setActiveTab] = useState<ManageTab>("budgets");
   const totalBalance = accounts.reduce(
@@ -2557,7 +2626,14 @@ function ManageView({
       </div>
 
       {activeTab === "budgets" && <BudgetsView categories={categories} request={request} onChanged={onChanged} />}
-      {activeTab === "accounts" && <AccountsView accounts={accounts} request={request} onChanged={onChanged} />}
+      {activeTab === "accounts" && (
+        <AccountsView
+          accounts={accounts}
+          request={request}
+          onChanged={onChanged}
+          onOpenTransactions={onOpenAccountTransactions}
+        />
+      )}
       {activeTab === "categories" && <CategoriesView categories={categories} request={request} onChanged={onChanged} />}
       {activeTab === "schedules" && <SchedulesView accounts={accounts} categories={categories} request={request} onNavigate={onNavigate} onTransfer={() => setActiveTab("accounts")} />}
     </section>
@@ -2783,7 +2859,17 @@ function SchedulesView({
   );
 }
 
-function AccountsView({ accounts, request, onChanged }: { accounts: Account[]; request: <T>(path: string, options?: RequestInit) => Promise<T>; onChanged: () => Promise<void> }) {
+function AccountsView({
+  accounts,
+  request,
+  onChanged,
+  onOpenTransactions
+}: {
+  accounts: Account[];
+  request: <T>(path: string, options?: RequestInit) => Promise<T>;
+  onChanged: () => Promise<void>;
+  onOpenTransactions: (accountId: string) => void;
+}) {
   const [error, setError] = useState<string | null>(null);
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
   const [accountView, setAccountView] = useState<"list" | "account-form" | "transfer-form">("list");
@@ -2793,6 +2879,7 @@ function AccountsView({ accounts, request, onChanged }: { accounts: Account[]; r
   const [transferAttachmentName, setTransferAttachmentName] = useState("");
   const [transferAttachmentLoading, setTransferAttachmentLoading] = useState(false);
   const [transferAttachmentMessage, setTransferAttachmentMessage] = useState<string | null>(null);
+  const [resettingAccount, setResettingAccount] = useState(false);
   const sourceAccount = accounts.find((account) => account.id === sourceAccountId);
   const destinationAccount = accounts.find((account) => account.id === destinationAccountId);
   const totalBalance = accounts.reduce(
@@ -2854,15 +2941,13 @@ function AccountsView({ accounts, request, onChanged }: { accounts: Account[]; r
       const payload = {
         name: String(form.get("name")),
         accountType: String(form.get("accountType")),
+        initialBalance: String(form.get("initialBalance")),
         currency: "IDR",
         allowNegative: form.get("allowNegative") === "on"
       };
       await request(editingAccount ? `/accounts/${editingAccount.id}` : "/accounts", {
         method: editingAccount ? "PUT" : "POST",
-        body: JSON.stringify(editingAccount ? payload : {
-          ...payload,
-          initialBalance: String(form.get("initialBalance")),
-        })
+        body: JSON.stringify(payload)
       });
       formElement.reset();
       setEditingAccount(null);
@@ -2870,6 +2955,32 @@ function AccountsView({ accounts, request, onChanged }: { accounts: Account[]; r
       setAccountView("list");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Akun gagal disimpan");
+    }
+  };
+
+  const resetAccount = async (form: HTMLFormElement) => {
+    if (!editingAccount) return;
+    const formData = new FormData(form);
+    const initialBalance = String(formData.get("initialBalance") || "0");
+    const confirmed = window.confirm(
+      `Reset akun ${editingAccount.name}?\n\nSemua transaksi dan transfer terkait akun ini akan dihapus permanen. Saldo akun akan dimulai lagi dari saldo awal yang tertera.`
+    );
+    if (!confirmed) return;
+
+    setResettingAccount(true);
+    setError(null);
+    try {
+      await request(`/accounts/${editingAccount.id}/reset`, {
+        method: "POST",
+        body: JSON.stringify({ initialBalance })
+      });
+      setEditingAccount(null);
+      await onChanged();
+      setAccountView("list");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Akun gagal direset");
+    } finally {
+      setResettingAccount(false);
     }
   };
 
@@ -2938,16 +3049,29 @@ function AccountsView({ accounts, request, onChanged }: { accounts: Account[]; r
           <EmptyState text="Belum ada akun. Tambahkan kas, rekening, atau e-wallet pertama Anda." />
         ) : (
           <div className="grid gap-2 md:grid-cols-2">
-            {accounts.map((account) => (
-              <div key={account.id} className="rounded-2xl border border-slate-100 bg-white px-3 py-3 lg:rounded-md">
+            {accounts.map((account) => {
+              const AccountIcon = accountTypeIcon(account.accountType);
+              return (
+                <div key={account.id} className="rounded-2xl border border-slate-100 bg-white px-3 py-3 lg:rounded-md">
                 <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <p className="truncate text-sm font-semibold text-slate-950">{account.name}</p>
-                    <p className="mt-0.5 text-xs font-semibold text-slate-500">{accountTypeLabel(account.accountType)}</p>
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-600 lg:rounded-md">
+                      <AccountIcon size={17} />
+                    </span>
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-semibold text-slate-950">{account.name}</p>
+                      <p className="mt-0.5 text-xs font-semibold text-slate-500">{accountTypeLabel(account.accountType)}</p>
+                    </div>
                   </div>
-                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl bg-emerald-50 text-[#00b817] lg:rounded-md">
-                    <CreditCard size={16} />
-                  </span>
+                  <button
+                    type="button"
+                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl bg-emerald-50 text-[#00b817] transition hover:bg-emerald-100 active:scale-95 lg:rounded-md"
+                    onClick={() => onOpenTransactions(account.id)}
+                    aria-label={`Lihat riwayat transaksi akun ${account.name}`}
+                    title="Lihat riwayat transaksi"
+                  >
+                    <ReceiptText size={16} />
+                  </button>
                 </div>
                 <p className="mt-3 text-lg font-semibold tracking-normal text-slate-950">{rupiah(account.currentBalance)}</p>
                 <div className="mt-1 flex items-center justify-between gap-2">
@@ -2965,7 +3089,8 @@ function AccountsView({ accounts, request, onChanged }: { accounts: Account[]; r
                   </button>
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
         </section>
@@ -3003,20 +3128,39 @@ function AccountsView({ accounts, request, onChanged }: { accounts: Account[]; r
                 <option value="other">Lainnya</option>
               </select>
             </Field>
-            {editingAccount ? (
+            <Field label="Saldo awal">
+              <input
+                className="input"
+                name="initialBalance"
+                inputMode="numeric"
+                placeholder="Contoh: 500000"
+                defaultValue={editingAccount ? moneyInputValue(editingAccount.initialBalance) : ""}
+                onInput={handleMoneyInput}
+                required
+              />
+            </Field>
+            {editingAccount && (
               <p className="rounded-2xl bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-500 lg:rounded-md">
-                Saldo akun tetap mengikuti transaksi dan transfer. Saldo sekarang {rupiah(editingAccount.currentBalance)}.
+                Mengubah saldo awal akan menghitung ulang saldo sekarang tanpa menghapus transaksi. Saldo sekarang {rupiah(editingAccount.currentBalance)}.
               </p>
-            ) : (
-              <Field label="Saldo awal">
-                <input className="input" name="initialBalance" inputMode="numeric" placeholder="Contoh: 500000" onInput={handleMoneyInput} required />
-              </Field>
             )}
             <label className="flex items-start gap-2 rounded-2xl bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-600 lg:rounded-md">
               <input className="mt-0.5" name="allowNegative" type="checkbox" defaultChecked={editingAccount?.allowNegative ?? false} />
               Izinkan saldo minus untuk akun ini
             </label>
             <button className="btn-primary w-full">{editingAccount ? <CheckCircle2 size={16} /> : <Plus size={16} />} {editingAccount ? "Simpan perubahan" : "Simpan akun"}</button>
+            {editingAccount && (
+              <button
+                type="button"
+                className="inline-flex w-full items-center justify-center gap-2 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700 transition hover:bg-rose-100 disabled:opacity-60 lg:rounded-md"
+                disabled={resettingAccount}
+                onClick={(event) => resetAccount(event.currentTarget.form!)}
+              >
+                {resettingAccount ? <Loader2 className="animate-spin" size={16} /> : <Trash2 size={16} />}
+                Reset akun & bersihkan transaksi
+              </button>
+            )}
+            {error && <p className="rounded-2xl bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-700 lg:rounded-md">{error}</p>}
           </div>
         </form>
       )}

@@ -51,6 +51,9 @@ export const accountSchema = z.object({
 });
 
 export const accountUpdateSchema = accountSchema.partial();
+export const accountResetSchema = z.object({
+  initialBalance: nonNegativeMoney.optional()
+});
 
 export const categorySchema = z.object({
   name: z.string().min(2).max(120),
