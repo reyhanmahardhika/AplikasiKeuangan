@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: finance-ai-api
+    runtime: node
+    plan: free
+    buildCommand: npm ci --include=dev && npm run build --workspace apps/server
+    startCommand: npm run db:migrate && npm run start --workspace apps/server
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: CLIENT_URL
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: MAX_UPLOAD_MB
+        value: "50"
+      - key: AI_PROVIDER
+        value: heuristic
