@@ -1,8 +1,11 @@
-import assert from "node:assert/strict";
 import test from "node:test";
-import { fromCents } from "../utils/money.js";
+import assert from "node:assert/strict";
+import { inferMerchant } from "./manualTransactionParser.js";
 
-test("keeps parser money conversion expectations explicit", () => {
-  assert.equal(fromCents(1500000n), "15000.00");
-  assert.equal(fromCents(20000000n), "200000.00");
+test("keeps the full merchant name after an Indonesian location preposition", () => {
+  assert.equal(inferMerchant("makan di sarune cafe 230rb cash", "230rb", "Tunai"), "Sarune Cafe");
+});
+
+test("keeps the salary period as the complete income source", () => {
+  assert.equal(inferMerchant("Gaji bulan juli 10jt bca", "10jt", "BCA"), "Gaji Bulan Juli");
 });

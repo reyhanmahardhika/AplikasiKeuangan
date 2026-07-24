@@ -406,12 +406,14 @@ function pickAccount(accounts: AccountOption[], text: string, defaultAccountId?:
   return defaultAccount ?? accounts[0] ?? null;
 }
 
-function inferMerchant(text: string, amountRaw?: string, paymentMethod?: string | null) {
+export function inferMerchant(text: string, amountRaw?: string, paymentMethod?: string | null) {
   for (const [pattern, merchant] of merchantAliases) {
     if (pattern.test(text)) return merchant;
   }
 
-  const cleaned = text
+  const locationMerchant = text.match(/\b(?:di|at)\s+(.+)$/i)?.[1];
+  const candidate = salaryPattern.test(text) ? text : locationMerchant ?? text;
+  const cleaned = candidate
     .toLowerCase()
     .replace(amountRaw?.toLowerCase() ?? "", " ")
     .replace(/\b(rp|cash|tunai|kontan|qris|qr|e[-\s]?money|emoney|flazz|tapcash|tap cash|brizzi|kmt|kartu multi trip|jakcard|jak card|debit|debit card|kredit|credit card|cc|bank transfer|transfer bank|virtual account|va|gopay|go pay|ovo|dana|shopeepay|spay|linkaja|link aja|bca|mandiri|bri|bni|permata|cimb|octo|jenius|blu)\b/gi, " ")
@@ -426,14 +428,30 @@ function inferMerchant(text: string, amountRaw?: string, paymentMethod?: string 
     .filter((token) => token && !fillerWords.has(token));
 
   if (!tokens.length) return null;
-  const merchantTokens = tokens.length > 1 ? tokens.slice(1) : tokens;
-  const merchant = merchantTokens.join(" ").trim();
+  const merchant = tokens.join(" ").trim();
   if (!merchant || merchant.toLowerCase() === paymentMethod?.toLowerCase()) return null;
   return merchant
     .split(" ")
     .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
     .join(" ")
     .slice(0, 180);
+}
+
+function preferMerchant(aiMerchant: string | null | undefined, inferredMerchant: string | null, isSalary: boolean) {
+  if (!aiMerchant) return inferredMerchant;
+  if (!inferredMerchant) return aiMerchant;
+  if (isSalary) return inferredMerchant;
+
+  const ai = aiMerchant.trim();
+  const inferred = inferredMerchant.trim();
+  const aiLower = ai.toLowerCase();
+  const inferredLower = inferred.toLowerCase();
+  const genericAiResult = /^(cafe|café|resto|restaurant|toko|store|shop|bulan|month)$/i.test(ai);
+  const inferredIsMoreSpecific =
+    inferred.split(/\s+/).length > ai.split(/\s+/).length &&
+    (inferredLower.includes(aiLower) || genericAiResult);
+
+  return inferredIsMoreSpecific ? inferred : ai;
 }
 
 function reviewFieldsFor(parsed: {
@@ -487,6 +505,7 @@ async function parseWithOpenAI(text: string, categories: CategoryOption[]): Prom
             `Gunakan kategori yang paling cocok dari daftar ini: ${categoryNames}. ` +
             `Pahami istilah lokal Indonesia seperti e-money/emoney, flazz, tapcash, brizzi, kmt, mrt, krl, gojek, grab, qris. ` +
             `Nominal gaji, gajian, salary, payroll, upah, atau wage wajib menjadi transactionType income dan categoryName Gaji. ` +
+            `merchantName harus berupa nama sumber atau merchant yang utuh, bukan satu kata generik. Contoh "makan di sarune cafe" menjadi "Sarune Cafe", dan "Gaji bulan juli" menjadi "Gaji bulan Juli". ` +
             `Jika nominal seperti 15k/15rb/15.000 artikan sebagai 15000.00. Isi null bila tidak yakin.`
         },
         { role: "user", content: text }
@@ -550,7 +569,8 @@ export async function parseNaturalTransaction(userId: string, textInput: string,
   const categoryName = isSalary ? "Gaji" : aiParsed?.categoryName ?? findCategoryName(text, transactionType);
   const category = pickCategory(categories, categoryName, transactionType);
   const account = pickAccount(accounts, text, defaultAccountId, accountHints);
-  const merchantName = aiParsed?.merchantName ?? inferMerchant(text, amountCandidate?.raw, paymentMethod);
+  const inferredMerchant = inferMerchant(text, amountCandidate?.raw, paymentMethod);
+  const merchantName = preferMerchant(aiParsed?.merchantName, inferredMerchant, isSalary);
   const transactionDate = aiParsed?.transactionDate ? localIsoDate(new Date(aiParsed.transactionDate)) : parseDate(text);
 
   const reviewFields = Array.from(

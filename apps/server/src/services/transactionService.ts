@@ -211,6 +211,9 @@ export async function createTransaction(userId: string, input: TransactionInput,
 export async function updateTransaction(userId: string, transactionId: string, input: TransactionInput) {
   return withDbTransaction(async (client) => {
     const previous = await fetchTransactionForUpdate(client, userId, transactionId);
+    if (previous.source_type === "transfer" || previous.status === "transfer") {
+      throw badRequest("Transaksi transfer tidak bisa diedit langsung");
+    }
     const previousAccount = await lockAccount(client, userId, previous.account_id);
     await applyAccountDelta(
       client,
@@ -258,6 +261,9 @@ export async function updateTransaction(userId: string, transactionId: string, i
 export async function deleteTransaction(userId: string, transactionId: string) {
   return withDbTransaction(async (client) => {
     const previous = await fetchTransactionForUpdate(client, userId, transactionId);
+    if (previous.source_type === "transfer" || previous.status === "transfer") {
+      throw badRequest("Transaksi transfer tidak bisa dihapus satu per satu");
+    }
     const previousAccount = await lockAccount(client, userId, previous.account_id);
     await applyAccountDelta(
       client,

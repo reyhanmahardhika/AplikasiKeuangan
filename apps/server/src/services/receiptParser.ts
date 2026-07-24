@@ -18,6 +18,8 @@ export type ParsedReceipt = {
   tax: string | null;
   fees: string | null;
   total: string | null;
+  amountPaid: string | null;
+  change: string | null;
   paymentMethod: string | null;
   suggestedCategory: string;
   confidenceScore: number;
@@ -109,11 +111,20 @@ function inferItems(lines: string[]) {
       /total|subtotal|sub total|pajak|tax|ppn|diskon|discount|bayar|payment|paid|tunai|cash|kembali|change|saldo|visa|master|debit|kredit|credit|qris|e[-\s]?money|emoney|gopay|ovo|dana|shopeepay|linkaja|struk|receipt|invoice|inv|nota/i.test(line)
     ) continue;
     if (/\b\d{1,2}[\/:-]\d{1,2}(?:[\/:-]\d{2,4})?\b/.test(line)) continue;
-    const match = line.match(/^(.{2,}?)\s+(\d+(?:[.,]\d+)?)?\s*x?\s*(?:rp\s*)?([0-9][0-9.,]{2,})$/i);
-    if (!match) continue;
-    const name = match[1].trim();
-    const quantity = Number(String(match[2] ?? 1).replace(",", "."));
-    const totalPrice = parseAmount(match[3]) ?? "0.00";
+    const amountTokens = extractAmountTokens(line);
+    const rawTotal = amountTokens.at(-1);
+    if (!rawTotal) continue;
+    const amountIndex = line.toLowerCase().lastIndexOf(rawTotal.toLowerCase());
+    let namePart = line.slice(0, amountIndex).replace(/(?:rp|idr)\s*$/i, "").trim();
+    let quantity = 1;
+    const quantityMatch = namePart.match(/(.+?)\s+(\d+(?:[.,]\d+)?)\s*x?$/i) ?? namePart.match(/(.+?)\s+x\s*(\d+(?:[.,]\d+)?)$/i);
+    if (quantityMatch) {
+      namePart = quantityMatch[1].trim();
+      quantity = Number(quantityMatch[2].replace(",", "."));
+    }
+    const name = namePart.trim();
+    if (name.length < 2 || !/[a-z]/i.test(name)) continue;
+    const totalPrice = parseAmount(rawTotal) ?? "0.00";
     const unitPrice = quantity > 0 ? (Number(totalPrice) / quantity).toFixed(2) : totalPrice;
     items.push({ name, quantity, unitPrice, totalPrice });
   }
@@ -145,6 +156,8 @@ const receiptSchema = {
     tax: { type: ["string", "null"] },
     fees: { type: ["string", "null"] },
     total: { type: ["string", "null"] },
+    amountPaid: { type: ["string", "null"] },
+    change: { type: ["string", "null"] },
     paymentMethod: { type: ["string", "null"] },
     suggestedCategory: { type: "string" },
     confidenceScore: { type: "number" },
@@ -174,6 +187,8 @@ const receiptSchema = {
     "tax",
     "fees",
     "total",
+    "amountPaid",
+    "change",
     "paymentMethod",
     "suggestedCategory",
     "confidenceScore",
@@ -207,7 +222,7 @@ async function parseWithOpenAI(rawText: string): Promise<ParsedReceipt> {
         {
           role: "system",
           content:
-            "Ubah teks OCR struk Indonesia menjadi JSON valid. Koreksi OCR yang jelas keliru, isi null bila tidak yakin, beri confidence 0-1, dan tandai field yang perlu dicek pengguna."
+            "Ubah teks OCR struk Indonesia menjadi JSON valid. Ambil rincian item, subtotal, diskon, pajak, biaya tambahan, total tagihan, nominal yang dibayar pelanggan, dan kembalian sebagai field terpisah. Koreksi OCR yang jelas keliru, isi null bila tidak yakin, beri confidence 0-1, dan tandai field yang perlu dicek pengguna."
         },
         { role: "user", content: rawText }
       ],
@@ -256,6 +271,14 @@ async function parseReceiptTextHeuristic(rawText: string): Promise<ParsedReceipt
   const subtotal = findLineAmount(lines, ["subtotal", "sub total"]);
   const tax = findLineAmount(lines, ["pajak", "tax", "ppn", "pb1"]);
   const discount = findLineAmount(lines, ["diskon", "discount"]);
+  const fees = findLineAmount(lines, ["biaya layanan", "service charge", "admin", "ongkos", "fee"]);
+  const amountPaid = findLineAmount([...lines].reverse(), ["uang diterima", "jumlah dibayar", "dibayar", "bayar", "tunai", "cash"], [
+    "total",
+    "subtotal",
+    "kembali",
+    "change"
+  ]);
+  const change = findLineAmount([...lines].reverse(), ["kembalian", "kembali", "change"]);
   const receiptNumber = text.match(/(?:no\.?|nomor|invoice|inv|struk)\s*[:#-]?\s*([a-z0-9-]+)/i)?.[1] ?? null;
   const merchantName = inferMerchant(lines);
   const transactionDate = parseDate(text);
@@ -285,8 +308,10 @@ async function parseReceiptTextHeuristic(rawText: string): Promise<ParsedReceipt
     subtotal,
     discount,
     tax,
-    fees: null,
+    fees,
     total,
+    amountPaid,
+    change,
     paymentMethod,
     suggestedCategory,
     confidenceScore: Number(confidenceScore.toFixed(2)),

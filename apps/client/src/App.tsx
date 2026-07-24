@@ -43,13 +43,32 @@ import {
   X
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import heic2any from "heic2any";
 import { ApiError, apiFetch, downloadUrl, type Session } from "./lib/api";
-import { isoDateInput, localDate, rupiah } from "./lib/format";
+import { formatRupiahInput, isoDateInput, localDate, rupiah } from "./lib/format";
+
+declare global {
+  interface Window {
+    google?: {
+      accounts: {
+        id: {
+          initialize: (options: { client_id: string; callback: (response: { credential: string }) => void }) => void;
+          renderButton: (element: HTMLElement, options: Record<string, unknown>) => void;
+        };
+      };
+    };
+    AppleID?: {
+      auth: {
+        init: (options: Record<string, unknown>) => void;
+        signIn: () => Promise<{ authorization: { id_token: string }; user?: { name?: { firstName?: string; lastName?: string } } }>;
+      };
+    };
+  }
+}
 
 type View =
   | "dashboard"
   | "manual"
-  | "receipt"
   | "history"
   | "transactionDetail"
   | "accounts"
@@ -92,9 +111,29 @@ type Transaction = {
   sourceType?: string;
 };
 
+type Schedule = {
+  id: string;
+  title: string;
+  scheduleType: "transaction" | "transfer" | "topup";
+  dueDay: number;
+  nextDueDate: string;
+  amount?: string | null;
+  accountId?: string | null;
+  destinationAccountId?: string | null;
+  categoryId?: string | null;
+  paymentMethod?: string | null;
+  notes?: string | null;
+  accountName?: string | null;
+  destinationAccountName?: string | null;
+  categoryName?: string | null;
+  daysUntilDue: number;
+  reminderStatus: "overdue" | "soon" | "upcoming";
+};
+
 type TransactionDetail = Transaction & {
   accountId: string;
   categoryId?: string;
+  receiptId?: string | null;
   items?: Array<{ itemName: string; quantity: string; unitPrice: string; totalPrice: string }>;
 };
 
@@ -134,10 +173,34 @@ type ParsedManualTransaction = {
   interpretedText: string;
 };
 
+type InstallPromptEvent = Event & {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
+};
+
 const savedSession = localStorage.getItem("finance-session");
 
-function moneyInputValue(value: string | null | undefined) {
-  return value?.replace(/\.00$/, "") ?? "";
+function successMessageFor(path: string, method: string) {
+  if (path.includes("/assistant/") || path.includes("/receipts/upload") || path.includes("/process")) return null;
+  if (path === "/transactions" && method === "POST") return "Berhasil menambah transaksi";
+  if (path.startsWith("/transactions/") && method === "PUT") return "Berhasil mengubah transaksi";
+  if (path.startsWith("/transactions/") && method === "DELETE") return "Berhasil menghapus transaksi";
+  if (path === "/transfers" && method === "POST") return "Berhasil transfer saldo";
+  if (path.includes("/receipts/") && path.endsWith("/confirm") && method === "POST") return "Berhasil menambah transaksi dari struk";
+  if (path === "/accounts" && method === "POST") return "Berhasil menambah akun";
+  if (path.startsWith("/accounts/") && method === "PUT") return "Berhasil mengubah akun";
+  if (path === "/categories" && method === "POST") return "Berhasil menambah kategori";
+  if (path.startsWith("/categories/") && method === "PUT") return "Berhasil mengubah kategori";
+  if (path === "/budgets" && method === "POST") return "Berhasil menyimpan budget";
+  if (path.startsWith("/budgets/") && method === "PUT") return "Berhasil mengubah budget";
+  if (path === "/schedules" && method === "POST") return "Berhasil menambah jadwal";
+  if (path.startsWith("/schedules/") && method === "PUT") return "Berhasil mengubah jadwal";
+  if (path.startsWith("/schedules/") && method === "DELETE") return "Berhasil menghapus jadwal";
+  return null;
+}
+
+function moneyInputValue(value: string | number | null | undefined) {
+  return formatRupiahInput(String(value ?? "").replace(/\.00$/, ""));
 }
 
 function dateFilterIso(value: string, boundary: "start" | "end") {
@@ -149,7 +212,6 @@ function dateFilterIso(value: string, boundary: "start" | "end") {
 const navigation: Array<{ id: View; label: string; icon: LucideIcon }> = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "manual", label: "Tambah", icon: Plus },
-  { id: "receipt", label: "Scan struk", icon: Camera },
   { id: "history", label: "Riwayat", icon: ReceiptText },
   { id: "accounts", label: "Akun", icon: Wallet },
   { id: "categories", label: "Kategori", icon: Tags },
@@ -171,18 +233,23 @@ function App() {
   const [view, setView] = useState<View>("dashboard");
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
+  const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [dashboard, setDashboard] = useState<DashboardSummary | null>(null);
   const [editing, setEditing] = useState<TransactionDetail | null>(null);
   const [selectedTransaction, setSelectedTransaction] = useState<TransactionDetail | null>(null);
   const [historyFocusTransactionId, setHistoryFocusTransactionId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [showScrollTop, setShowScrollTop] = useState(false);
+  const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
+  const [installedAsApp, setInstalledAsApp] = useState(() => window.matchMedia("(display-mode: standalone)").matches);
+  const notifiedScheduleIds = useRef(new Set<string>());
   const token = session?.accessToken;
 
   const clearSession = (message?: string) => {
     setSession(null);
     setAccounts([]);
     setCategories([]);
+    setSchedules([]);
     setDashboard(null);
     if (message) setNotice(message);
   };
@@ -207,13 +274,20 @@ function App() {
   };
 
   const request = async <T,>(path: string, options: RequestInit = {}) => {
+    const method = String(options.method ?? "GET").toUpperCase();
     try {
-      return await apiFetch<T>(path, session?.accessToken, options);
+      const result = await apiFetch<T>(path, session?.accessToken, options);
+      const message = successMessageFor(path, method);
+      if (message) setNotice(message);
+      return result;
     } catch (error) {
       if (error instanceof ApiError && error.status === 401 && session?.refreshToken && path !== "/auth/refresh-token") {
         try {
           const refreshedToken = await refreshAccessToken();
-          return await apiFetch<T>(path, refreshedToken, options);
+          const result = await apiFetch<T>(path, refreshedToken, options);
+          const message = successMessageFor(path, method);
+          if (message) setNotice(message);
+          return result;
         } catch {
           clearSession("Sesi sudah berakhir. Silakan login kembali.");
           throw new Error("Sesi sudah berakhir. Silakan login kembali.");
@@ -225,14 +299,16 @@ function App() {
 
   const refreshCore = async () => {
     if (!token) return;
-    const [nextAccounts, nextCategories, nextDashboard] = await Promise.all([
+    const [nextAccounts, nextCategories, nextDashboard, nextSchedules] = await Promise.all([
       request<Account[]>("/accounts"),
       request<Category[]>("/categories"),
-      request<DashboardSummary>("/dashboard/summary")
+      request<DashboardSummary>("/dashboard/summary"),
+      request<Schedule[]>("/schedules").catch(() => [])
     ]);
     setAccounts(nextAccounts);
     setCategories(nextCategories);
     setDashboard(nextDashboard);
+    setSchedules(nextSchedules);
   };
 
   useEffect(() => {
@@ -251,8 +327,52 @@ function App() {
     return () => window.removeEventListener("scroll", updateScrollButton);
   }, []);
 
+  useEffect(() => {
+    const captureInstallPrompt = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event as InstallPromptEvent);
+    };
+    const markInstalled = () => {
+      setInstalledAsApp(true);
+      setInstallPrompt(null);
+    };
+    window.addEventListener("beforeinstallprompt", captureInstallPrompt);
+    window.addEventListener("appinstalled", markInstalled);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", captureInstallPrompt);
+      window.removeEventListener("appinstalled", markInstalled);
+    };
+  }, []);
+
+  const installApp = async () => {
+    if (installPrompt) {
+      await installPrompt.prompt();
+      const choice = await installPrompt.userChoice;
+      if (choice.outcome === "accepted") setInstallPrompt(null);
+      return;
+    }
+    if (/iphone|ipad|ipod/i.test(navigator.userAgent)) {
+      window.alert("Di Safari, ketuk tombol Bagikan lalu pilih Tambahkan ke Layar Utama.");
+      return;
+    }
+    window.alert("Buka menu browser lalu pilih Instal aplikasi atau Tambahkan ke layar utama.");
+  };
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(null), 3200);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  useEffect(() => {
+    const dueSchedules = schedules.filter((schedule) => schedule.reminderStatus !== "upcoming" && !notifiedScheduleIds.current.has(schedule.id));
+    if (!dueSchedules.length) return;
+    dueSchedules.forEach((schedule) => notifiedScheduleIds.current.add(schedule.id));
+    setNotice(`${dueSchedules.length} jadwal perlu diperhatikan`);
+  }, [schedules]);
+
   if (!session) {
-    return <AuthView onSignedIn={setSession} />;
+    return <AuthView onSignedIn={setSession} onInstall={installApp} showInstall={!installedAsApp} />;
   }
 
   const navigate = (nextView: View) => {
@@ -345,10 +465,10 @@ function App() {
           </div>
         </header>
 
-        <MobileTopBar userName={session.user.fullName} onProfile={() => navigate("profile")} />
+        <MobileTopBar user={session.user} onProfile={() => navigate("profile")} />
 
         {notice && (
-          <div className="mx-4 mt-4 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 lg:mx-8">
+          <div className="fixed left-4 right-4 top-4 z-50 rounded-2xl border border-emerald-100 bg-white px-4 py-3 text-sm font-semibold text-slate-800 shadow-[0_18px_44px_rgba(15,23,42,0.16)] lg:left-auto lg:right-6 lg:w-96 lg:rounded-lg">
             {notice}
           </div>
         )}
@@ -364,7 +484,6 @@ function App() {
             <DashboardView
               dashboard={dashboard}
               onAdd={() => navigate("manual")}
-              onScan={() => navigate("receipt")}
               onAssistant={() => navigate("assistant")}
             />
           )}
@@ -374,7 +493,6 @@ function App() {
               categories={categories}
               editing={editing}
               request={request}
-              onScan={() => navigate("receipt")}
               onCancel={() => {
                 if (editing && selectedTransaction) {
                   navigate("transactionDetail");
@@ -397,12 +515,6 @@ function App() {
               }}
             />
           )}
-          {view === "receipt" && (
-            <ReceiptView accounts={accounts} categories={categories} request={request} onDone={async () => {
-              await refreshCore();
-              navigate("history");
-            }} />
-          )}
           {view === "history" && (
             <HistoryView
               request={request}
@@ -416,6 +528,7 @@ function App() {
           {view === "transactionDetail" && selectedTransaction && (
             <TransactionDetailView
               transaction={selectedTransaction}
+              token={token!}
               onBack={() => {
                 setHistoryFocusTransactionId(selectedTransaction.id);
                 navigate("history");
@@ -428,11 +541,25 @@ function App() {
           {view === "categories" && <CategoriesView categories={categories} request={request} onChanged={refreshCore} />}
           {view === "budgets" && <BudgetsView categories={categories} request={request} onChanged={refreshCore} />}
           {view === "manage" && (
-            <ManageView accounts={accounts} categories={categories} request={request} onChanged={refreshCore} />
+            <ManageView accounts={accounts} categories={categories} request={request} onNavigate={navigate} onChanged={refreshCore} />
           )}
           {view === "reports" && <ReportsView request={request} />}
           {view === "assistant" && <AssistantView request={request} />}
-          {view === "profile" && <ProfileView session={session} request={request} onLogout={() => clearSession()} />}
+          {view === "profile" && (
+            <ProfileView
+              session={session}
+              request={request}
+              onProfileUpdated={(user) => setSession((current) => {
+                if (!current) return current;
+                const nextSession = { ...current, user };
+                localStorage.setItem("finance-session", JSON.stringify(nextSession));
+                return nextSession;
+              })}
+              onInstall={installApp}
+              showInstall={!installedAsApp}
+              onLogout={() => clearSession()}
+            />
+          )}
         </main>
 
         <MobileBottomNav view={view} onNavigate={navigate} />
@@ -452,17 +579,17 @@ function App() {
   );
 }
 
-function MobileTopBar({ userName, onProfile }: { userName: string; onProfile: () => void }) {
+function MobileTopBar({ user, onProfile }: { user: Session["user"]; onProfile: () => void }) {
   return (
     <header className="sticky top-0 z-20 bg-[#f4f8ff]/95 px-4 pb-2 pt-4 backdrop-blur lg:hidden">
       <div className="flex items-center justify-between">
         <div className="flex min-w-0 items-center gap-2.5">
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-rose-400 via-violet-500 to-emerald-400 text-sm font-black text-white shadow-sm">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-rose-400 via-violet-500 to-emerald-400 text-sm font-semibold text-white shadow-sm">
             F
           </div>
           <div className="min-w-0">
-            <p className="text-base font-black leading-tight">Finly AI</p>
-            <p className="truncate text-xs text-slate-500">Hai, {userName}</p>
+            <p className="text-base font-semibold leading-tight">Finly AI</p>
+            <p className="truncate text-xs text-slate-500">Hai, {user.nickname || user.fullName}</p>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -471,7 +598,11 @@ function MobileTopBar({ userName, onProfile }: { userName: string; onProfile: ()
             <span className="absolute right-2 top-2 h-2 w-2 rounded-full bg-rose-500 ring-2 ring-white" />
           </button>
           <button className="mobile-avatar-btn" aria-label="Profil" title="Profil" onClick={onProfile}>
-            <UserRound size={18} />
+            {user.avatarUrl ? (
+              <img className="h-full w-full rounded-full object-cover" src={user.avatarUrl} alt="" />
+            ) : (
+              <UserRound size={18} />
+            )}
           </button>
         </div>
       </div>
@@ -539,10 +670,108 @@ function MobileNavButton({
   );
 }
 
-function AuthView({ onSignedIn }: { onSignedIn: (session: Session) => void }) {
+function loadAuthScript(id: string, src: string) {
+  return new Promise<void>((resolve, reject) => {
+    const existing = document.getElementById(id) as HTMLScriptElement | null;
+    if (existing) {
+      if (existing.dataset.loaded === "true") resolve();
+      else existing.addEventListener("load", () => resolve(), { once: true });
+      return;
+    }
+    const script = document.createElement("script");
+    script.id = id;
+    script.src = src;
+    script.async = true;
+    script.defer = true;
+    script.addEventListener("load", () => {
+      script.dataset.loaded = "true";
+      resolve();
+    });
+    script.addEventListener("error", () => reject(new Error("Provider login gagal dimuat")));
+    document.head.appendChild(script);
+  });
+}
+
+function AuthView({
+  onSignedIn,
+  onInstall,
+  showInstall
+}: {
+  onSignedIn: (session: Session) => void;
+  onInstall: () => Promise<void>;
+  showInstall: boolean;
+}) {
   const [mode, setMode] = useState<"login" | "register">("login");
   const [loading, setLoading] = useState(false);
+  const [socialLoading, setSocialLoading] = useState<"google" | "apple" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const googleButtonRef = useRef<HTMLDivElement>(null);
+  const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined;
+  const appleClientId = import.meta.env.VITE_APPLE_CLIENT_ID as string | undefined;
+
+  const completeSocialLogin = async (provider: "google" | "apple", idToken: string, fullName?: string) => {
+    setSocialLoading(provider);
+    setError(null);
+    try {
+      onSignedIn(await apiFetch<Session>("/auth/social", undefined, {
+        method: "POST",
+        body: JSON.stringify({ provider, idToken, fullName: fullName || null })
+      }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `Login ${provider} gagal`);
+    } finally {
+      setSocialLoading(null);
+    }
+  };
+
+  useEffect(() => {
+    if (!googleClientId || !googleButtonRef.current) return;
+    let active = true;
+    loadAuthScript("google-identity-script", "https://accounts.google.com/gsi/client")
+      .then(() => {
+        if (!active || !window.google || !googleButtonRef.current) return;
+        window.google.accounts.id.initialize({
+          client_id: googleClientId,
+          callback: (response) => completeSocialLogin("google", response.credential)
+        });
+        googleButtonRef.current.innerHTML = "";
+        window.google.accounts.id.renderButton(googleButtonRef.current, {
+          type: "standard",
+          theme: "outline",
+          size: "large",
+          text: mode === "login" ? "signin_with" : "signup_with",
+          shape: "rectangular",
+          width: 360
+        });
+      })
+      .catch((err) => active && setError(err.message));
+    return () => { active = false; };
+  }, [googleClientId, mode]);
+
+  const signInWithApple = async () => {
+    if (!appleClientId) {
+      setError("Login Apple belum dikonfigurasi. Isi VITE_APPLE_CLIENT_ID dan APPLE_CLIENT_ID.");
+      return;
+    }
+    setSocialLoading("apple");
+    setError(null);
+    try {
+      await loadAuthScript("apple-identity-script", "https://appleid.cdn-apple.com/appleauth/static/jsapi/appleid/1/en_US/appleid.auth.js");
+      window.AppleID!.auth.init({
+        clientId: appleClientId,
+        scope: "name email",
+        redirectURI: import.meta.env.VITE_APPLE_REDIRECT_URI || window.location.origin,
+        usePopup: true
+      });
+      const response = await window.AppleID!.auth.signIn();
+      const name = response.user?.name;
+      const fullName = [name?.firstName, name?.lastName].filter(Boolean).join(" ");
+      await completeSocialLogin("apple", response.authorization.id_token, fullName);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Login Apple dibatalkan");
+      setSocialLoading(null);
+    }
+  };
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -550,21 +779,13 @@ function AuthView({ onSignedIn }: { onSignedIn: (session: Session) => void }) {
     setError(null);
     const form = new FormData(event.currentTarget);
     try {
-      const payload =
-        mode === "register"
-          ? {
-              fullName: String(form.get("fullName")),
-              email: String(form.get("email")),
-              password: String(form.get("password")),
-              currency: "IDR"
-            }
-          : { email: String(form.get("email")), password: String(form.get("password")) };
-      onSignedIn(
-        await apiFetch<Session>(`/auth/${mode === "register" ? "register" : "login"}`, undefined, {
-          method: "POST",
-          body: JSON.stringify(payload)
-        })
-      );
+      const payload = mode === "register"
+        ? { fullName: String(form.get("fullName")), email: String(form.get("email")), password: String(form.get("password")), currency: "IDR" }
+        : { email: String(form.get("email")), password: String(form.get("password")) };
+      onSignedIn(await apiFetch<Session>(`/auth/${mode === "register" ? "register" : "login"}`, undefined, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Gagal masuk");
     } finally {
@@ -573,69 +794,62 @@ function AuthView({ onSignedIn }: { onSignedIn: (session: Session) => void }) {
   };
 
   return (
-    <div className="min-h-screen bg-slate-100 px-4 py-10">
-      <div className="mx-auto grid max-w-5xl overflow-hidden rounded-lg border border-slate-200 bg-white shadow-soft lg:grid-cols-[1.1fr_0.9fr]">
-        <section className="bg-slate-900 p-8 text-white lg:p-12">
-          <div className="mb-16 flex items-center gap-3">
-            <div className="flex h-11 w-11 items-center justify-center rounded-md bg-[#00b817]">
-              <Wallet size={24} />
-            </div>
-            <div>
-              <h1 className="text-2xl font-bold">Keuangan AI</h1>
-              <p className="text-sm text-slate-300">Pencatatan keuangan berbasis struk dan data pribadi</p>
-            </div>
-          </div>
-          <div className="grid gap-4 sm:grid-cols-3 lg:grid-cols-1">
-            {[
-              ["Saldo", "Rp12.450.000", "Rekening aktif"],
-              ["Pengeluaran", "Rp3.210.000", "Bulan berjalan"],
-              ["Confidence", "91%", "Hasil scan terakhir"]
-            ].map(([label, value, caption]) => (
-              <div key={label} className="rounded-lg border border-white/15 bg-white/10 p-4">
-                <p className="text-sm text-slate-300">{label}</p>
-                <p className="mt-2 text-2xl font-bold">{value}</p>
-                <p className="text-xs text-slate-400">{caption}</p>
-              </div>
-            ))}
-          </div>
-        </section>
-        <section className="p-6 sm:p-8 lg:p-12">
-          <div className="mb-6 flex rounded-md bg-slate-100 p-1">
-            <button className={`flex-1 rounded-md px-4 py-2 text-sm font-semibold ${mode === "login" ? "bg-white shadow-sm" : "text-slate-500"}`} onClick={() => setMode("login")}>
-              Login
+    <div className="flex min-h-screen items-center justify-center bg-[#f4f8ff] px-4 py-8">
+      <main className="w-full max-w-md overflow-hidden rounded-[26px] border border-white bg-white shadow-[0_24px_70px_rgba(15,23,42,0.12)] lg:rounded-lg">
+        <header className="border-b border-emerald-100 bg-emerald-50/70 px-6 py-6 text-center">
+          <span className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-[#00b817] text-white shadow-[0_12px_26px_rgba(0,184,23,0.24)] lg:rounded-md">
+            <Wallet size={23} />
+          </span>
+          <h1 className="mt-3 text-xl font-semibold text-slate-950">Keuangan AI</h1>
+          <p className="mt-1 text-sm text-slate-500">{mode === "login" ? "Masuk untuk melanjutkan pencatatanmu." : "Buat akun dan mulai kelola keuanganmu."}</p>
+          {showInstall && (
+            <button type="button" className="mt-3 inline-flex items-center gap-1.5 text-xs font-semibold text-[#00b817]" onClick={onInstall}>
+              <Download size={14} /> Pasang aplikasi
             </button>
-            <button className={`flex-1 rounded-md px-4 py-2 text-sm font-semibold ${mode === "register" ? "bg-white shadow-sm" : "text-slate-500"}`} onClick={() => setMode("register")}>
-              Registrasi
-            </button>
+          )}
+        </header>
+
+        <section className="p-5 sm:p-6">
+          <div className="mb-5 grid grid-cols-2 rounded-xl bg-slate-100 p-1">
+            <button type="button" className={`rounded-lg px-4 py-2 text-sm font-semibold ${mode === "login" ? "bg-white text-slate-950 shadow-sm" : "text-slate-500"}`} onClick={() => { setMode("login"); setError(null); }}>Masuk</button>
+            <button type="button" className={`rounded-lg px-4 py-2 text-sm font-semibold ${mode === "register" ? "bg-white text-slate-950 shadow-sm" : "text-slate-500"}`} onClick={() => { setMode("register"); setError(null); }}>Daftar</button>
           </div>
-          <form className="space-y-4" onSubmit={submit}>
-            {mode === "register" && (
-              <label className="block text-sm font-medium">
-                Nama lengkap
-                <input className="input mt-1" name="fullName" required minLength={2} />
-              </label>
+
+          <div className="space-y-2">
+            {googleClientId ? (
+              <div className="flex min-h-10 w-full items-center justify-center overflow-hidden" ref={googleButtonRef} />
+            ) : (
+              <button type="button" className="btn-secondary w-full" onClick={() => setError("Login Google belum dikonfigurasi. Isi VITE_GOOGLE_CLIENT_ID dan GOOGLE_CLIENT_ID.")}>Lanjutkan dengan Google</button>
             )}
-            <label className="block text-sm font-medium">
-              Email
-              <input className="input mt-1" name="email" type="email" required />
-            </label>
-            <label className="block text-sm font-medium">
-              Password
-              <input className="input mt-1" name="password" type="password" required minLength={8} />
-            </label>
-            {error && <p className="rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}
-            <button className="btn-primary w-full" disabled={loading}>
+            <button type="button" className="flex w-full items-center justify-center rounded-xl bg-black px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800" onClick={signInWithApple} disabled={socialLoading === "apple"}>
+              {socialLoading === "apple" ? <Loader2 className="animate-spin" size={16} /> : null}
+              Lanjutkan dengan Apple
+            </button>
+          </div>
+
+          <div className="my-5 flex items-center gap-3 text-xs text-slate-400"><span className="h-px flex-1 bg-slate-200" /><span>atau gunakan email</span><span className="h-px flex-1 bg-slate-200" /></div>
+
+          <form className="space-y-3" onSubmit={submit}>
+            {mode === "register" && <Field label="Nama lengkap"><input className="input" name="fullName" autoComplete="name" required minLength={2} /></Field>}
+            <Field label="Email"><input className="input" name="email" type="email" autoComplete="email" required /></Field>
+            <Field label="Password"><input className="input" name="password" type="password" autoComplete={mode === "login" ? "current-password" : "new-password"} required minLength={8} /></Field>
+            {error && <p className="rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}
+            <button className="btn-primary w-full" disabled={loading || Boolean(socialLoading)}>
               {loading ? <Loader2 className="animate-spin" size={16} /> : <CheckCircle2 size={16} />}
               {mode === "login" ? "Masuk" : "Buat akun"}
             </button>
           </form>
         </section>
-      </div>
+      </main>
     </div>
   );
 }
 
 const categoryPalette = ["#16c784", "#f6a90b", "#60a5fa", "#2dd4bf", "#8b5cf6", "#ec4899"];
+
+function handleMoneyInput(event: FormEvent<HTMLInputElement>) {
+  event.currentTarget.value = formatRupiahInput(event.currentTarget.value);
+}
 
 function ExpenseDonut({ dashboard }: { dashboard: DashboardSummary }) {
   const rows = dashboard.expenseByCategory.slice(0, 5);
@@ -665,7 +879,7 @@ function ExpenseDonut({ dashboard }: { dashboard: DashboardSummary }) {
           <div className="relative mx-auto h-40 w-40 rounded-full" style={{ background: donutBackground }}>
             <div className="absolute inset-9 flex flex-col items-center justify-center rounded-full bg-white text-center shadow-inner">
               <span className="text-[11px] font-semibold text-slate-500">Total</span>
-              <span className="text-sm font-black">{rupiah(dashboard.expenseThisMonth)}</span>
+              <span className="text-sm font-semibold">{rupiah(dashboard.expenseThisMonth)}</span>
             </div>
           </div>
           <div className="space-y-2.5">
@@ -694,12 +908,10 @@ function ExpenseDonut({ dashboard }: { dashboard: DashboardSummary }) {
 function DashboardView({
   dashboard,
   onAdd,
-  onScan,
   onAssistant
 }: {
   dashboard: DashboardSummary | null;
   onAdd: () => void;
-  onScan: () => void;
   onAssistant: () => void;
 }) {
   if (!dashboard) return <LoadingState />;
@@ -728,11 +940,11 @@ function DashboardView({
         <div className="relative overflow-hidden rounded-[26px] bg-[#003d12] p-4 text-white shadow-[0_18px_42px_rgba(0,184,23,0.24)] lg:rounded-lg lg:p-5">
           <div className="flex items-start justify-between gap-3">
             <div>
-              <p className="text-[11px] font-black uppercase text-white/65">Saldo aktif</p>
-              <h2 className="mt-1 text-2xl font-black tracking-normal sm:text-3xl">{rupiah(balance)}</h2>
+              <p className="text-[11px] font-semibold uppercase text-white/65">Saldo aktif</p>
+              <h2 className="mt-1 text-2xl font-semibold tracking-normal sm:text-3xl">{rupiah(balance)}</h2>
               <p className="mt-1 text-xs font-semibold text-white/70">Update dari semua akun aktif</p>
             </div>
-            <span className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-black ${healthClass}`}>
+            <span className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-semibold ${healthClass}`}>
               {healthLabel}
             </span>
           </div>
@@ -740,22 +952,19 @@ function DashboardView({
           <div className="mt-4 grid grid-cols-2 gap-2">
             <div className="rounded-2xl bg-white/12 px-3 py-2 lg:rounded-md">
               <p className="text-[11px] font-semibold text-white/65">Net bulan ini</p>
-              <p className={`mt-0.5 text-sm font-black ${net >= 0 ? "text-emerald-100" : "text-rose-100"}`}>
+              <p className={`mt-0.5 text-sm font-semibold ${net >= 0 ? "text-emerald-100" : "text-rose-100"}`}>
                 {net >= 0 ? "+" : "-"}{rupiah(Math.abs(net))}
               </p>
             </div>
             <div className="rounded-2xl bg-white/12 px-3 py-2 lg:rounded-md">
               <p className="text-[11px] font-semibold text-white/65">Rata-rata keluar</p>
-              <p className="mt-0.5 text-sm font-black">{rupiah(averageExpense)}/hari</p>
+              <p className="mt-0.5 text-sm font-semibold">{rupiah(averageExpense)}/hari</p>
             </div>
           </div>
 
           <div className="mt-4 flex flex-wrap gap-2">
-            <button className="inline-flex items-center justify-center gap-2 rounded-2xl bg-white px-4 py-2.5 text-xs font-black text-[#008f12] shadow-sm transition hover:bg-emerald-50 lg:rounded-md" onClick={onAdd}>
+            <button className="inline-flex items-center justify-center gap-2 rounded-2xl bg-white px-4 py-2.5 text-xs font-semibold text-[#008f12] shadow-sm transition hover:bg-emerald-50 lg:rounded-md" onClick={onAdd}>
               <Plus size={15} /> Tambah
-            </button>
-            <button className="inline-flex items-center justify-center gap-2 rounded-2xl border border-white/20 bg-white/10 px-4 py-2.5 text-xs font-black text-white transition hover:bg-white/18 lg:rounded-md" onClick={onScan}>
-              <Camera size={15} /> Scan struk
             </button>
           </div>
         </div>
@@ -771,7 +980,7 @@ function DashboardView({
                 <Bot size={20} />
               </span>
               <span className="min-w-0">
-                <span className="block text-sm font-black text-slate-950">Virtual Assistant</span>
+                <span className="block text-sm font-semibold text-slate-950">Virtual Assistant</span>
                 <span className="mt-0.5 block text-xs font-semibold text-slate-500">Tanya kondisi uangmu dengan bahasa bebas.</span>
               </span>
             </span>
@@ -779,7 +988,7 @@ function DashboardView({
           </span>
           <span className="mt-3 flex flex-wrap gap-1.5">
             {["Saldo", "Budget", "Boros apa?"].map((item) => (
-              <span key={item} className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-black text-slate-600">
+              <span key={item} className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-600">
                 {item}
               </span>
             ))}
@@ -791,10 +1000,10 @@ function DashboardView({
         <div className="overflow-hidden rounded-[26px] border border-white/80 bg-white shadow-soft lg:rounded-lg lg:border-slate-200">
           <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
             <div>
-              <p className="text-[10px] font-black uppercase text-slate-400">{monthLabel}</p>
-              <h3 className="text-sm font-black text-slate-950">Ringkasan bulan ini</h3>
+              <p className="text-[10px] font-semibold uppercase text-slate-400">{monthLabel}</p>
+              <h3 className="text-sm font-semibold text-slate-950">Ringkasan bulan ini</h3>
             </div>
-            <span className={`rounded-full px-2.5 py-1 text-[11px] font-black ${healthClass}`}>{ratioLabel}</span>
+            <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${healthClass}`}>{ratioLabel}</span>
           </div>
           <div className="grid grid-cols-2 gap-px bg-slate-100 sm:grid-cols-4">
             <DashboardMetric label="Masuk" value={rupiah(income)} helper="Pemasukan" tone="income" icon={<ArrowDownLeft size={16} />} />
@@ -805,7 +1014,7 @@ function DashboardView({
           <div className="px-4 py-3">
             <div className="mb-2 flex items-center justify-between text-xs">
               <span className="font-bold text-slate-500">Rasio pengeluaran</span>
-              <span className="font-black text-slate-900">{ratioLabel}</span>
+              <span className="font-semibold text-slate-900">{ratioLabel}</span>
             </div>
             <div className="h-2 overflow-hidden rounded-full bg-slate-100">
               <div
@@ -819,12 +1028,12 @@ function DashboardView({
         <div className="grid grid-cols-2 gap-3 xl:grid-cols-1">
           <div className="rounded-[22px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200">
             <p className="text-[11px] font-bold text-slate-400">Kategori teratas</p>
-            <p className="mt-1 truncate text-sm font-black text-slate-950">{topCategory?.category ?? "Belum ada"}</p>
+            <p className="mt-1 truncate text-sm font-semibold text-slate-950">{topCategory?.category ?? "Belum ada"}</p>
             <p className="mt-1 text-xs font-semibold text-slate-500">{topCategory ? rupiah(topCategory.total) : "Belum ada pengeluaran"}</p>
           </div>
           <div className="rounded-[22px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200">
             <p className="text-[11px] font-bold text-slate-400">Anggaran</p>
-            <p className={`mt-1 text-sm font-black ${alertCount > 0 ? "text-amber-700" : "text-[#00b817]"}`}>
+            <p className={`mt-1 text-sm font-semibold ${alertCount > 0 ? "text-amber-700" : "text-[#00b817]"}`}>
               {alertCount > 0 ? `${alertCount} perlu dicek` : "Terkendali"}
             </p>
             <p className="mt-1 truncate text-xs font-semibold text-slate-500">
@@ -838,10 +1047,10 @@ function DashboardView({
         <div className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200 lg:p-5">
           <div className="mb-4 flex items-center justify-between">
             <div>
-              <h3 className="text-sm font-black text-slate-950">Arus kas harian</h3>
+              <h3 className="text-sm font-semibold text-slate-950">Arus kas harian</h3>
               <p className="text-xs font-semibold text-slate-500">Aktivitas bulan berjalan</p>
             </div>
-            <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-black text-slate-500">
+            <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-500">
               <span className="h-2 w-2 rounded-full bg-[#00b817]" /> Masuk
               <span className="ml-1 h-2 w-2 rounded-full bg-rose-400" /> Keluar
             </span>
@@ -855,11 +1064,11 @@ function DashboardView({
 
       <section className="grid gap-3 lg:gap-5 xl:grid-cols-2">
         <div className="card p-4 lg:p-5">
-          <h3 className="mb-4 text-sm font-black text-slate-950">Aktivitas terbaru</h3>
+          <h3 className="mb-4 text-sm font-semibold text-slate-950">Aktivitas terbaru</h3>
           <TransactionList rows={dashboard.lastTransactions} />
         </div>
         <div className="card p-4 lg:p-5">
-          <h3 className="mb-4 text-sm font-black text-slate-950">Notifikasi anggaran</h3>
+          <h3 className="mb-4 text-sm font-semibold text-slate-950">Notifikasi anggaran</h3>
           {dashboard.budgetAlerts.length === 0 ? <EmptyState text="Tidak ada peringatan anggaran." /> : (
             <div className="space-y-3">
               {dashboard.budgetAlerts.map((alert) => (
@@ -899,7 +1108,7 @@ function DashboardMetric({
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
           <p className="text-[11px] font-bold text-slate-400">{label}</p>
-          <p className="mt-1 truncate text-sm font-black text-slate-950">{value}</p>
+          <p className="mt-1 truncate text-sm font-semibold text-slate-950">{value}</p>
         </div>
         <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-2xl lg:rounded-md ${tones[tone]}`}>
           {icon}
@@ -961,7 +1170,7 @@ function SummaryCard({
         <p className="text-xs font-semibold text-slate-500 sm:text-sm">{label}</p>
         <span className={`flex h-9 w-9 items-center justify-center rounded-xl lg:h-10 lg:w-10 lg:rounded-md ${tones[tone]}`}>{icon}</span>
       </div>
-      <p className="mt-3 text-xl font-black tracking-normal sm:text-2xl lg:mt-4">{value}</p>
+      <p className="mt-3 text-xl font-semibold tracking-normal sm:text-2xl lg:mt-4">{value}</p>
     </div>
   );
 }
@@ -971,7 +1180,6 @@ function ManualTransactionView({
   categories,
   editing,
   request,
-  onScan,
   onCancel,
   onDone
 }: {
@@ -979,7 +1187,6 @@ function ManualTransactionView({
   categories: Category[];
   editing: TransactionDetail | null;
   request: <T>(path: string, options?: RequestInit) => Promise<T>;
-  onScan: () => void;
   onCancel: () => void;
   onDone: () => Promise<void>;
 }) {
@@ -1002,6 +1209,11 @@ function ManualTransactionView({
   const [parseResult, setParseResult] = useState<ParsedManualTransaction | null>(null);
   const [parseLoading, setParseLoading] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [attachmentLoading, setAttachmentLoading] = useState(false);
+  const [attachmentName, setAttachmentName] = useState("");
+  const [attachmentReceiptId, setAttachmentReceiptId] = useState<string | null>(editing?.receiptId ?? null);
+  const [attachmentMessage, setAttachmentMessage] = useState<string | null>(null);
+  const [budgets, setBudgets] = useState<BudgetRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [errorContext, setErrorContext] = useState<"parse" | "submit" | null>(null);
   const formCardRef = useRef<HTMLDivElement>(null);
@@ -1016,9 +1228,50 @@ function ManualTransactionView({
     setDraft(initialDraft);
     setFormVersion((current) => current + 1);
     setParseResult(null);
+    setAttachmentName("");
+    setAttachmentReceiptId(editing?.receiptId ?? null);
+    setAttachmentMessage(null);
     setError(null);
     setErrorContext(null);
   }, [editing?.id, initialDraft]);
+
+  useEffect(() => {
+    request<BudgetRow[]>("/budgets")
+      .then(setBudgets)
+      .catch(() => setBudgets([]));
+  }, []);
+
+  const uploadAttachment = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setAttachmentLoading(true);
+    setAttachmentName(file.name);
+    setAttachmentMessage("Mengunggah attachment...");
+    setError(null);
+    setErrorContext(null);
+
+    try {
+      const uploadForm = new FormData();
+      uploadForm.set("receipt", file);
+      try {
+        const uploaded = await request<{ id: string }>("/receipts/upload", { method: "POST", body: uploadForm });
+        setAttachmentReceiptId(uploaded.id);
+      } catch (err) {
+        const duplicateId = err instanceof ApiError && err.status === 409 && err.details && typeof err.details === "object"
+          ? String((err.details as { receiptId?: unknown }).receiptId ?? "")
+          : "";
+        if (!duplicateId) throw err;
+        setAttachmentReceiptId(duplicateId);
+      }
+      setAttachmentMessage("Attachment berhasil diunggah.");
+    } catch {
+      setAttachmentMessage("Attachment gagal diunggah. Pastikan file berupa gambar atau video.");
+    } finally {
+      setAttachmentLoading(false);
+      event.target.value = "";
+    }
+  };
 
   const parseFreeText = async () => {
     if (!freeText.trim()) {
@@ -1061,6 +1314,33 @@ function ManualTransactionView({
     }
   };
 
+  const updateAmount = (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.currentTarget;
+    const cursor = input.selectionStart ?? input.value.length;
+    const digitsBeforeCursor = input.value.slice(0, cursor).replace(/\D/g, "").length;
+    const formatted = formatRupiahInput(input.value);
+
+    setDraft((current) => ({ ...current, amount: formatted }));
+    window.requestAnimationFrame(() => {
+      if (document.activeElement !== input) return;
+      if (!digitsBeforeCursor) {
+        input.setSelectionRange(0, 0);
+        return;
+      }
+
+      let seenDigits = 0;
+      let nextCursor = formatted.length;
+      for (let index = 0; index < formatted.length; index += 1) {
+        if (/\d/.test(formatted[index])) seenDigits += 1;
+        if (seenDigits === digitsBeforeCursor) {
+          nextCursor = index + 1;
+          break;
+        }
+      }
+      input.setSelectionRange(nextCursor, nextCursor);
+    });
+  };
+
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setLoading(true);
@@ -1077,6 +1357,7 @@ function ManualTransactionView({
       paymentMethod: String(form.get("paymentMethod") || "") || null,
       notes: String(form.get("notes") || "") || null,
       sourceType: "manual",
+      receiptId: attachmentReceiptId,
       items: []
     };
     try {
@@ -1094,8 +1375,13 @@ function ManualTransactionView({
   };
 
   const filteredCategories = categories.filter((category) => category.categoryType === transactionType);
-  const selectedAccountName = accounts.find((account) => account.id === draft.accountId)?.name ?? parseResult?.accountName ?? "Pilih akun";
+  const selectedAccount = accounts.find((account) => account.id === draft.accountId);
+  const selectedAccountName = selectedAccount?.name ?? parseResult?.accountName ?? "Pilih akun";
   const selectedCategoryName = categories.find((category) => category.id === draft.categoryId)?.name ?? parseResult?.categoryName ?? "Tanpa kategori";
+  const selectedBudget = budgets.find((budget) => budget.categoryId === draft.categoryId);
+  const nextExpenseAmount = transactionType === "expense" ? Number(String(draft.amount).replace(/[^\d]/g, "")) : 0;
+  const budgetAfterUse = selectedBudget ? moneyValue(selectedBudget.used) + nextExpenseAmount : 0;
+  const budgetAfterPercent = selectedBudget && moneyValue(selectedBudget.budgetAmount) > 0 ? Math.round((budgetAfterUse / moneyValue(selectedBudget.budgetAmount)) * 100) : 0;
 
   return (
     <section className="mx-auto max-w-4xl space-y-3 lg:space-y-5">
@@ -1104,10 +1390,10 @@ function ManualTransactionView({
           <div className="border-b border-slate-100 bg-gradient-to-r from-emerald-50 to-white px-4 py-4 lg:px-5">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
-                <span className="inline-flex items-center gap-1.5 rounded-full bg-white px-2.5 py-1 text-[10px] font-black uppercase text-[#00b817] shadow-sm">
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold uppercase text-[#00b817] shadow-sm">
                   <Sparkles size={12} /> AI quick add
                 </span>
-                <h2 className="mt-2 text-xl font-black tracking-normal text-slate-950">Tambah transaksi</h2>
+                <h2 className="mt-2 text-xl font-semibold tracking-normal text-slate-950">Tambah transaksi</h2>
                 <p className="mt-1 text-xs font-semibold leading-5 text-slate-500">
                   Ketik bebas, AI bantu isi nominal, kategori, akun, dan metode pembayaran.
                 </p>
@@ -1116,17 +1402,10 @@ function ManualTransactionView({
                 <Bot size={19} />
               </span>
             </div>
-            <button
-              type="button"
-              className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-2xl border border-emerald-100 bg-white px-3 py-2.5 text-xs font-black text-[#008f12] shadow-sm transition hover:bg-emerald-50 sm:w-auto lg:rounded-md"
-              onClick={onScan}
-            >
-              <Camera size={15} /> Scan struk
-            </button>
           </div>
 
           <div className="space-y-3 p-4 lg:p-5">
-            <label className="block text-xs font-black text-slate-600">
+            <label className="block text-xs font-semibold text-slate-600">
               Tulis transaksi
               <textarea
                 className="mt-1 min-h-24 w-full resize-none rounded-[20px] border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold leading-6 text-slate-950 outline-none transition placeholder:text-slate-400 focus:border-emerald-400 focus:bg-white focus:ring-2 focus:ring-emerald-100 lg:rounded-md"
@@ -1146,7 +1425,7 @@ function ManualTransactionView({
                 <button
                   type="button"
                   key={example}
-                  className="rounded-full bg-slate-100 px-3 py-1.5 text-[11px] font-black text-slate-600 transition hover:bg-emerald-50 hover:text-[#00b817]"
+                  className="rounded-full bg-slate-100 px-3 py-1.5 text-[11px] font-semibold text-slate-600 transition hover:bg-emerald-50 hover:text-[#00b817]"
                   onClick={() => setFreeText(example)}
                 >
                   {example}
@@ -1160,7 +1439,7 @@ function ManualTransactionView({
               </p>
               <button
                 type="button"
-                className="inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-[#00b817] px-4 py-3 text-sm font-black text-white shadow-[0_12px_24px_rgba(0,184,23,0.22)] transition hover:bg-[#009714] disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto lg:rounded-md"
+                className="inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-[#00b817] px-4 py-3 text-sm font-semibold text-white shadow-[0_12px_24px_rgba(0,184,23,0.22)] transition hover:bg-[#009714] disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto lg:rounded-md"
                 onClick={parseFreeText}
                 disabled={parseLoading || accounts.length === 0}
               >
@@ -1176,29 +1455,29 @@ function ManualTransactionView({
             {parseResult && (
               <div className="rounded-[20px] border border-emerald-100 bg-emerald-50/70 p-3 text-sm lg:rounded-md">
                 <div className="mb-3 flex items-center justify-between gap-3">
-                  <span className="inline-flex items-center gap-2 font-black text-slate-950">
+                  <span className="inline-flex items-center gap-2 font-semibold text-slate-950">
                     <CheckCircle2 size={16} className="text-[#00b817]" /> Hasil AI
                   </span>
-                  <span className="rounded-full bg-white px-2.5 py-1 text-xs font-black text-[#00b817]">
+                  <span className="rounded-full bg-white px-2.5 py-1 text-xs font-semibold text-[#00b817]">
                     {Math.round(parseResult.confidenceScore * 100)}% yakin
                   </span>
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <p className="text-[10px] font-black uppercase text-slate-400">Tipe</p>
-                    <p className="font-black text-slate-950">{parseResult.transactionType === "income" ? "Pemasukan" : "Pengeluaran"}</p>
+                    <p className="text-[10px] font-semibold uppercase text-slate-400">Tipe</p>
+                    <p className="font-semibold text-slate-950">{parseResult.transactionType === "income" ? "Pemasukan" : "Pengeluaran"}</p>
                   </div>
                   <div>
-                    <p className="text-[10px] font-black uppercase text-slate-400">Nominal</p>
-                    <p className="font-black text-slate-950">{rupiah(parseResult.amount)}</p>
+                    <p className="text-[10px] font-semibold uppercase text-slate-400">Nominal</p>
+                    <p className="font-semibold text-slate-950">{rupiah(parseResult.amount)}</p>
                   </div>
                   <div>
-                    <p className="text-[10px] font-black uppercase text-slate-400">Kategori</p>
-                    <p className="truncate font-black text-slate-950">{selectedCategoryName}</p>
+                    <p className="text-[10px] font-semibold uppercase text-slate-400">Kategori</p>
+                    <p className="truncate font-semibold text-slate-950">{selectedCategoryName}</p>
                   </div>
                   <div>
-                    <p className="text-[10px] font-black uppercase text-slate-400">Akun</p>
-                    <p className="truncate font-black text-slate-950">{selectedAccountName}</p>
+                    <p className="text-[10px] font-semibold uppercase text-slate-400">Akun</p>
+                    <p className="truncate font-semibold text-slate-950">{selectedAccountName}</p>
                   </div>
                 </div>
                 {parseResult.reviewFields.length > 0 && (
@@ -1217,7 +1496,7 @@ function ManualTransactionView({
           {editing && (
             <button
               type="button"
-              className="mb-4 inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-black text-slate-700 transition hover:bg-slate-50"
+              className="mb-4 inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-50"
               onClick={onCancel}
             >
               <ArrowLeft size={15} /> Kembali
@@ -1231,8 +1510,8 @@ function ManualTransactionView({
                 {transactionType === "income" ? <ArrowDownLeft size={18} /> : <ArrowUpRight size={18} />}
               </span>
               <div className="min-w-0">
-                <p className="text-[10px] font-black uppercase text-slate-400">{editing ? "Edit" : parseResult ? "Konfirmasi AI" : "Detail"}</p>
-                <h2 className="mt-0.5 text-base font-black tracking-normal text-slate-950">{editing ? "Edit transaksi" : "Detail transaksi"}</h2>
+                <p className="text-[10px] font-semibold uppercase text-slate-400">{editing ? "Edit" : parseResult ? "Konfirmasi AI" : "Detail"}</p>
+                <h2 className="mt-0.5 text-base font-semibold tracking-normal text-slate-950">{editing ? "Edit transaksi" : "Detail transaksi"}</h2>
                 <p className="mt-0.5 text-xs font-semibold text-slate-500">
                   {editing ? "Ubah data yang diperlukan lalu simpan." : parseResult ? "Hasil AI sudah masuk, cek sebelum simpan." : "Isi manual atau mulai dari AI di atas."}
                 </p>
@@ -1241,7 +1520,7 @@ function ManualTransactionView({
             <div className="grid w-full grid-cols-2 rounded-2xl bg-slate-100 p-1 sm:w-fit lg:rounded-md">
               <button
                 type="button"
-                className={`rounded-xl px-3 py-2 text-sm font-black transition lg:rounded-md ${
+                className={`rounded-xl px-3 py-2 text-sm font-semibold transition lg:rounded-md ${
                   transactionType === "income" ? "bg-white text-[#008f12] shadow-sm" : "text-slate-500"
                 }`}
                 onClick={() => setTransactionType("income")}
@@ -1250,7 +1529,7 @@ function ManualTransactionView({
               </button>
               <button
                 type="button"
-                className={`rounded-xl px-3 py-2 text-sm font-black transition lg:rounded-md ${
+                className={`rounded-xl px-3 py-2 text-sm font-semibold transition lg:rounded-md ${
                   transactionType === "expense" ? "bg-white text-rose-700 shadow-sm" : "text-slate-500"
                 }`}
                 onClick={() => setTransactionType("expense")}
@@ -1265,38 +1544,105 @@ function ManualTransactionView({
             <input className="input" name="transactionDate" type="date" defaultValue={draft.transactionDate} required />
           </Field>
           <Field label="Nominal">
-            <input className="input" name="amount" inputMode="decimal" min="1" defaultValue={draft.amount} required />
+            <input
+              className="input"
+              name="amount"
+              inputMode="numeric"
+              min="1"
+              value={draft.amount}
+              onChange={updateAmount}
+              required
+            />
           </Field>
           <Field label="Akun">
-            <select className="input" name="accountId" defaultValue={draft.accountId} required>
-              {accounts.map((account) => (
-                <option key={account.id} value={account.id}>{account.name}</option>
-              ))}
-            </select>
+            <div>
+              <select
+                className="input"
+                name="accountId"
+                value={draft.accountId}
+                onChange={(event) => setDraft((current) => ({ ...current, accountId: event.target.value }))}
+                required
+              >
+                {accounts.map((account) => (
+                  <option key={account.id} value={account.id}>{account.name} - {rupiah(account.currentBalance)}</option>
+                ))}
+              </select>
+              {selectedAccount && (
+                <div className="mt-1.5 flex items-center justify-between px-1 text-xs text-slate-500">
+                  <span>Saldo saat ini</span>
+                  <span className="font-semibold text-slate-900">{rupiah(selectedAccount.currentBalance)}</span>
+                </div>
+              )}
+            </div>
           </Field>
           <Field label="Kategori">
-            <select className="input" name="categoryId" defaultValue={draft.categoryId}>
+            <select className="input" name="categoryId" defaultValue={draft.categoryId} onChange={(event) => setDraft((current) => ({ ...current, categoryId: event.target.value }))}>
               <option value="">Tanpa kategori</option>
               {filteredCategories.map((category) => (
                 <option key={category.id} value={category.id}>{category.name}</option>
               ))}
             </select>
           </Field>
+          {transactionType === "expense" && selectedBudget && (
+            <div className="rounded-2xl border border-emerald-100 bg-emerald-50/60 px-3 py-2.5 text-xs md:col-span-2 lg:rounded-md">
+              <div className="flex items-center justify-between gap-3">
+                <span className="font-semibold text-slate-600">Budget {selectedBudget.category}</span>
+                <span className={`font-semibold ${budgetAfterPercent > 100 ? "text-rose-600" : "text-[#00b817]"}`}>{budgetAfterPercent}% setelah transaksi</span>
+              </div>
+              <div className="mt-2 h-2 overflow-hidden rounded-full bg-white">
+                <div className={`h-full rounded-full ${budgetAfterPercent > 100 ? "bg-rose-500" : "bg-[#00b817]"}`} style={{ width: `${Math.min(budgetAfterPercent, 100)}%` }} />
+              </div>
+              <p className="mt-2 font-semibold text-slate-500">
+                Terpakai {rupiah(selectedBudget.used)} + transaksi ini {rupiah(nextExpenseAmount)} dari {rupiah(selectedBudget.budgetAmount)}.
+              </p>
+            </div>
+          )}
           <Field label="Sumber atau merchant">
             <input className="input" name="merchantName" defaultValue={draft.merchantName} />
           </Field>
           <Field label="Metode pembayaran">
             <input className="input" name="paymentMethod" defaultValue={draft.paymentMethod} placeholder="Tunai, QRIS, debit" />
           </Field>
-          <label className="block text-xs font-black text-slate-600 md:col-span-2">
+          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 md:col-span-2 lg:rounded-md">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-xs font-semibold text-slate-700">Attachment transaksi</p>
+                <p className="mt-0.5 text-[11px] leading-4 text-slate-500">
+                  Tambahkan gambar atau video sebagai bukti pendukung transaksi.
+                </p>
+              </div>
+              <label className="inline-flex shrink-0 cursor-pointer items-center gap-1.5 rounded-xl bg-white px-3 py-2 text-xs font-semibold text-[#00b817] shadow-sm ring-1 ring-slate-200 transition hover:bg-emerald-50 lg:rounded-md">
+                {attachmentLoading ? <Loader2 className="animate-spin" size={14} /> : <Upload size={14} />}
+                {attachmentReceiptId ? "Ganti" : "Pilih file"}
+                <input className="sr-only" type="file" accept="image/*,video/*,.heic,.heif" onChange={uploadAttachment} disabled={attachmentLoading} />
+              </label>
+            </div>
+            {(attachmentName || editing?.receiptId) && (
+              <div className="mt-2 flex items-center gap-2 rounded-xl bg-white px-3 py-2 text-xs text-slate-600 lg:rounded-md">
+                <ReceiptText className="shrink-0 text-[#00b817]" size={14} />
+                <span className="truncate">{attachmentName || "Attachment transaksi tersimpan"}</span>
+              </div>
+            )}
+            {attachmentMessage && (
+              <p className={`mt-2 text-[11px] leading-4 ${attachmentMessage.includes("berhasil") ? "text-[#008f12]" : "text-slate-500"}`}>
+                {attachmentMessage}
+              </p>
+            )}
+          </div>
+          <label className="block text-xs font-semibold text-slate-600 md:col-span-2">
             Catatan
             <div className="mt-1">
-              <textarea className="input min-h-20" name="notes" defaultValue={draft.notes} />
+              <textarea
+                className="input min-h-28 whitespace-pre-wrap"
+                name="notes"
+                value={draft.notes}
+                onChange={(event) => setDraft((current) => ({ ...current, notes: event.target.value }))}
+              />
             </div>
           </label>
           {error && errorContext === "submit" && <p className="rounded-2xl bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-700 md:col-span-2 lg:rounded-md">{error}</p>}
           <div className="md:col-span-2">
-            <button className="btn-primary w-full" disabled={loading || accounts.length === 0}>
+            <button className="btn-primary w-full" disabled={loading || attachmentLoading || accounts.length === 0}>
               {loading ? <Loader2 className="animate-spin" size={16} /> : <CheckCircle2 size={16} />}
               Simpan transaksi
             </button>
@@ -1309,29 +1655,97 @@ function ManualTransactionView({
 
 function TransactionDetailView({
   transaction,
+  token,
   onBack,
   onEdit,
   onDelete
 }: {
   transaction: TransactionDetail;
+  token: string;
   onBack: () => void;
   onEdit: () => void;
   onDelete: () => void;
 }) {
   const isIncome = transaction.transactionType === "income";
+  const [attachmentPreviewUrl, setAttachmentPreviewUrl] = useState<string | null>(null);
+  const [attachmentOriginalUrl, setAttachmentOriginalUrl] = useState<string | null>(null);
+  const [attachmentPreviewLoading, setAttachmentPreviewLoading] = useState(Boolean(transaction.receiptId));
+  const [attachmentContentType, setAttachmentContentType] = useState("");
+
+  useEffect(() => {
+    if (!transaction.receiptId) {
+      setAttachmentPreviewUrl(null);
+      setAttachmentOriginalUrl(null);
+      setAttachmentPreviewLoading(false);
+      return;
+    }
+
+    let active = true;
+    const objectUrls: string[] = [];
+    setAttachmentPreviewLoading(true);
+    const loadAttachment = async () => {
+      try {
+        const response = await fetch(downloadUrl(`/receipts/${transaction.receiptId}/file`), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (!response.ok) throw new Error("Attachment tidak dapat dimuat");
+        const blob = await response.blob();
+        const contentType = response.headers.get("content-type") ?? blob.type;
+        const fileSignature = new TextDecoder("ascii").decode(await blob.slice(4, 16).arrayBuffer());
+        const isHeic = /image\/hei[cf]/i.test(contentType) || /ftyp(?:heic|heix|hevc|hevx|mif1|msf1)/i.test(fileSignature);
+        const originalUrl = URL.createObjectURL(blob);
+        objectUrls.push(originalUrl);
+        if (!active) return;
+        setAttachmentOriginalUrl(originalUrl);
+
+        if (isHeic) {
+          try {
+            const converted = await heic2any({ blob, toType: "image/jpeg", quality: 0.9 });
+            const previewBlob = Array.isArray(converted) ? converted[0] : converted;
+            const previewUrl = URL.createObjectURL(previewBlob);
+            objectUrls.push(previewUrl);
+            if (!active) return;
+            setAttachmentContentType("image/jpeg");
+            setAttachmentPreviewUrl(previewUrl);
+          } catch {
+            setAttachmentContentType(contentType);
+            setAttachmentPreviewUrl(null);
+          }
+        } else {
+          setAttachmentContentType(contentType);
+          setAttachmentPreviewUrl(originalUrl);
+        }
+      } catch {
+        if (active) {
+          setAttachmentPreviewUrl(null);
+          setAttachmentOriginalUrl(null);
+        }
+      } finally {
+        if (active) setAttachmentPreviewLoading(false);
+      }
+    };
+    loadAttachment();
+
+    return () => {
+      active = false;
+      objectUrls.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, [transaction.receiptId, token]);
+
   const detailRows = [
     ["Tanggal", localDate(transaction.transactionDate)],
     ["Akun", transaction.accountName ?? "-"],
     ["Metode", transaction.paymentMethod ?? "-"],
     ["Kategori", transaction.categoryName ?? "Tanpa kategori"],
-    ["Sumber", transaction.sourceType ?? "Manual"]
+    ["Sumber", transaction.sourceType ?? "Manual"],
+    ...(transaction.receiptId ? [["Attachment", "File tersimpan"]] : [])
   ];
 
   return (
     <section className="mx-auto max-w-3xl space-y-3">
       <button
         type="button"
-        className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-black text-slate-700 shadow-sm transition hover:bg-slate-50"
+        className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50"
         onClick={onBack}
       >
         <ArrowLeft size={15} /> Kembali
@@ -1345,12 +1759,12 @@ function TransactionDetailView({
                 {transactionCategoryIcon(transaction)}
               </span>
               <div className="min-w-0">
-                <h2 className="truncate text-lg font-black text-slate-950">{transactionTitle(transaction)}</h2>
+                <h2 className="truncate text-lg font-semibold text-slate-950">{transactionTitle(transaction)}</h2>
                 <p className="mt-1 text-xs font-semibold text-slate-500">{transaction.accountName ?? "-"}{transaction.paymentMethod ? ` - ${transaction.paymentMethod}` : ""}</p>
               </div>
             </div>
             <div className="shrink-0 text-right">
-              <p className={`text-lg font-black ${isIncome ? "text-[#00b817]" : "text-slate-950"}`}>
+              <p className={`text-lg font-semibold ${isIncome ? "text-[#00b817]" : "text-slate-950"}`}>
                 {isIncome ? "+" : "-"}{rupiah(transaction.amount)}
               </p>
               <p className="mt-1 text-xs font-semibold text-slate-400">{isIncome ? "Pemasukan" : "Pengeluaran"}</p>
@@ -1361,11 +1775,68 @@ function TransactionDetailView({
         <dl className="grid gap-3 p-5 sm:grid-cols-2">
           {detailRows.map(([label, value]) => (
             <div key={label} className="rounded-2xl bg-slate-50 px-3 py-2.5 lg:rounded-md">
-              <dt className="text-[11px] font-black uppercase text-slate-400">{label}</dt>
+              <dt className="text-[11px] font-semibold uppercase text-slate-400">{label}</dt>
               <dd className="mt-1 text-sm font-bold text-slate-900">{value}</dd>
             </div>
           ))}
         </dl>
+
+        {transaction.notes && (
+          <div className="border-t border-slate-100 px-5 py-4">
+            <p className="text-[11px] font-semibold uppercase text-slate-400">Catatan</p>
+            <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-700">{transaction.notes}</p>
+          </div>
+        )}
+
+        {transaction.receiptId && (
+          <div className="border-t border-slate-100 px-5 py-4">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div>
+                <p className="text-[11px] font-semibold uppercase text-slate-400">Attachment</p>
+                <p className="mt-1 text-sm font-semibold text-slate-900">File attachment transaksi</p>
+              </div>
+              {attachmentOriginalUrl && (
+                <button
+                  type="button"
+                  className="text-xs font-semibold text-[#00b817]"
+                  onClick={() => window.open(attachmentOriginalUrl, "_blank", "noopener,noreferrer")}
+                >
+                  Buka file
+                </button>
+              )}
+            </div>
+            {attachmentPreviewLoading ? (
+              <div className="flex h-44 items-center justify-center rounded-2xl bg-slate-50 text-slate-400 lg:rounded-md">
+                <Loader2 className="animate-spin" size={22} />
+              </div>
+            ) : attachmentPreviewUrl && attachmentContentType.startsWith("video/") ? (
+              <video className="max-h-[520px] w-full rounded-2xl bg-black lg:rounded-md" src={attachmentPreviewUrl} controls preload="metadata">
+                Browser tidak mendukung preview video ini.
+              </video>
+            ) : attachmentPreviewUrl && attachmentContentType.startsWith("image/") ? (
+              <button
+                type="button"
+                className="block w-full overflow-hidden rounded-2xl bg-slate-100 lg:rounded-md"
+                onClick={() => window.open(attachmentPreviewUrl, "_blank", "noopener,noreferrer")}
+                aria-label="Buka attachment ukuran penuh"
+              >
+                <img className="max-h-[520px] w-full object-contain" src={attachmentPreviewUrl} alt="Attachment transaksi" />
+              </button>
+            ) : attachmentOriginalUrl ? (
+              <button
+                type="button"
+                className="flex w-full items-center justify-center gap-2 rounded-2xl bg-slate-50 px-4 py-8 text-sm font-semibold text-[#00b817] lg:rounded-md"
+                onClick={() => window.open(attachmentOriginalUrl, "_blank", "noopener,noreferrer")}
+              >
+                <ReceiptText size={18} /> Buka attachment
+              </button>
+            ) : (
+              <p className="rounded-2xl bg-rose-50 px-3 py-3 text-xs text-rose-700 lg:rounded-md">
+                Attachment tidak dapat dimuat.
+              </p>
+            )}
+          </div>
+        )}
 
         <div className="grid grid-cols-[1fr_auto] gap-2 border-t border-slate-100 p-5">
           <button type="button" className="btn-primary" onClick={onEdit}>
@@ -1485,8 +1956,8 @@ function ReceiptView({
       <section className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200 lg:p-5">
         <div className="mb-4 flex items-start justify-between gap-3">
           <div>
-            <p className="text-[10px] font-black uppercase text-[#00b817]">Scan struk</p>
-            <h2 className="mt-0.5 text-lg font-black text-slate-950">Upload atau foto struk</h2>
+            <p className="text-[10px] font-semibold uppercase text-[#00b817]">Scan struk</p>
+            <h2 className="mt-0.5 text-lg font-semibold text-slate-950">Upload atau foto struk</h2>
             <p className="mt-1 text-xs font-semibold text-slate-500">Pilih sumber, cek preview, lalu proses OCR.</p>
           </div>
           <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-emerald-50 text-[#00b817] lg:rounded-md">
@@ -1499,13 +1970,13 @@ function ReceiptView({
         <input ref={fileInputRef} className="sr-only" type="file" accept="image/jpeg,image/png,application/pdf" onChange={selectFile} />
 
         <div className="grid grid-cols-3 gap-2">
-          <button type="button" className="flex flex-col items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 px-2 py-3 text-xs font-black text-slate-700 transition hover:border-emerald-100 hover:bg-emerald-50 hover:text-[#00b817] lg:rounded-md" onClick={() => cameraInputRef.current?.click()}>
+          <button type="button" className="flex flex-col items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 px-2 py-3 text-xs font-semibold text-slate-700 transition hover:border-emerald-100 hover:bg-emerald-50 hover:text-[#00b817] lg:rounded-md" onClick={() => cameraInputRef.current?.click()}>
             <Camera size={18} /> Kamera
           </button>
-          <button type="button" className="flex flex-col items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 px-2 py-3 text-xs font-black text-slate-700 transition hover:border-emerald-100 hover:bg-emerald-50 hover:text-[#00b817] lg:rounded-md" onClick={() => galleryInputRef.current?.click()}>
+          <button type="button" className="flex flex-col items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 px-2 py-3 text-xs font-semibold text-slate-700 transition hover:border-emerald-100 hover:bg-emerald-50 hover:text-[#00b817] lg:rounded-md" onClick={() => galleryInputRef.current?.click()}>
             <ReceiptText size={18} /> Galeri
           </button>
-          <button type="button" className="flex flex-col items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 px-2 py-3 text-xs font-black text-slate-700 transition hover:border-emerald-100 hover:bg-emerald-50 hover:text-[#00b817] lg:rounded-md" onClick={() => fileInputRef.current?.click()}>
+          <button type="button" className="flex flex-col items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 px-2 py-3 text-xs font-semibold text-slate-700 transition hover:border-emerald-100 hover:bg-emerald-50 hover:text-[#00b817] lg:rounded-md" onClick={() => fileInputRef.current?.click()}>
             <Upload size={18} /> File
           </button>
         </div>
@@ -1516,13 +1987,13 @@ function ReceiptView({
           ) : selectedFile ? (
             <div className="flex min-h-44 flex-col items-center justify-center px-4 py-8 text-center">
               <ReceiptText className="mb-3 text-[#00b817]" size={28} />
-              <p className="text-sm font-black text-slate-950">{selectedFile.name}</p>
+              <p className="text-sm font-semibold text-slate-950">{selectedFile.name}</p>
               <p className="mt-1 text-xs font-semibold text-slate-500">PDF siap diproses.</p>
             </div>
           ) : (
             <div className="flex min-h-44 flex-col items-center justify-center px-4 py-8 text-center">
               <Upload className="mb-3 text-slate-400" size={28} />
-              <p className="text-sm font-black text-slate-700">Belum ada struk</p>
+              <p className="text-sm font-semibold text-slate-700">Belum ada struk</p>
               <p className="mt-1 text-xs font-semibold text-slate-500">JPG, PNG, atau PDF maksimal 8 MB.</p>
             </div>
           )}
@@ -1758,11 +2229,11 @@ function HistoryView({
       <div className="rounded-[22px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <p className="text-[10px] font-black uppercase text-[#00b817]">Transaksi</p>
-            <h2 className="mt-0.5 text-base font-black tracking-normal text-slate-950">Riwayat transaksi</h2>
+            <p className="text-[10px] font-semibold uppercase text-[#00b817]">Transaksi</p>
+            <h2 className="mt-0.5 text-base font-semibold tracking-normal text-slate-950">Riwayat transaksi</h2>
             <p className="mt-1 text-xs font-semibold text-slate-500">{rows.length} transaksi tampil</p>
           </div>
-          <span className="rounded-full bg-emerald-50 px-3 py-1 text-[11px] font-black text-[#00b817]">
+          <span className="rounded-full bg-emerald-50 px-3 py-1 text-[11px] font-semibold text-[#00b817]">
             {type === "income" ? "Masuk" : type === "expense" ? "Keluar" : "Semua"}
           </span>
         </div>
@@ -1772,17 +2243,17 @@ function HistoryView({
               <p className="text-[11px] font-bold text-white/75">Net transaksi</p>
               <p className="mt-0.5 text-[11px] font-semibold text-white/65">Sesuai filter aktif</p>
             </div>
-            <p className="shrink-0 text-base font-black">{netTotal >= 0 ? "+" : "-"}{rupiah(Math.abs(netTotal))}</p>
+            <p className="shrink-0 text-base font-semibold">{netTotal >= 0 ? "+" : "-"}{rupiah(Math.abs(netTotal))}</p>
           </div>
         </div>
         <div className="mt-2 grid grid-cols-2 gap-2">
           <div className="rounded-2xl bg-emerald-50 px-3 py-2 lg:rounded-md">
             <p className="text-[11px] font-bold text-[#008f12]">Masuk</p>
-            <p className="mt-0.5 text-[13px] font-black leading-tight text-[#008f12]">{rupiah(totalIncome)}</p>
+            <p className="mt-0.5 text-[13px] font-semibold leading-tight text-[#008f12]">{rupiah(totalIncome)}</p>
           </div>
           <div className="rounded-2xl bg-rose-50 px-3 py-2 lg:rounded-md">
             <p className="text-[11px] font-bold text-rose-700">Keluar</p>
-            <p className="mt-0.5 text-[13px] font-black leading-tight text-rose-700">{rupiah(totalExpense)}</p>
+            <p className="mt-0.5 text-[13px] font-semibold leading-tight text-rose-700">{rupiah(totalExpense)}</p>
           </div>
         </div>
       </div>
@@ -1814,7 +2285,7 @@ function HistoryView({
             <button
               key={option.value}
               type="button"
-              className={`rounded-xl px-3 py-2 text-xs font-black transition lg:rounded-md ${
+              className={`rounded-xl px-3 py-2 text-xs font-semibold transition lg:rounded-md ${
                 type === option.value ? "bg-white text-slate-950 shadow-sm" : "text-slate-500"
               }`}
               onClick={() => applyType(option.value)}
@@ -1826,7 +2297,7 @@ function HistoryView({
 
         <div className="mt-3 grid grid-cols-2 gap-2">
           <label className="relative block rounded-2xl border border-slate-200 bg-white px-3 py-2 lg:rounded-md">
-            <span className="text-[10px] font-black uppercase text-slate-400">Dari</span>
+            <span className="text-[10px] font-semibold uppercase text-slate-400">Dari</span>
             <input
               className="mt-1 w-full bg-transparent text-xs font-bold text-slate-800 outline-none"
               type="date"
@@ -1841,7 +2312,7 @@ function HistoryView({
             )}
           </label>
           <label className="relative block rounded-2xl border border-slate-200 bg-white px-3 py-2 lg:rounded-md">
-            <span className="text-[10px] font-black uppercase text-slate-400">Sampai</span>
+            <span className="text-[10px] font-semibold uppercase text-slate-400">Sampai</span>
             <input
               className="mt-1 w-full bg-transparent text-xs font-bold text-slate-800 outline-none"
               type="date"
@@ -1860,8 +2331,8 @@ function HistoryView({
         <div className="mt-3 flex items-center justify-between border-t border-slate-100 pt-3">
           <p className="text-[11px] font-bold text-slate-400">Export</p>
           <div className="flex gap-2">
-            <button className="inline-flex items-center gap-1 rounded-full border border-slate-200 px-3 py-1.5 text-xs font-black text-slate-700 transition hover:bg-slate-50" onClick={() => exportFile("csv")}><Download size={13} /> CSV</button>
-            <button className="inline-flex items-center gap-1 rounded-full border border-slate-200 px-3 py-1.5 text-xs font-black text-slate-700 transition hover:bg-slate-50" onClick={() => exportFile("excel")}><FileSpreadsheet size={13} /> Excel</button>
+            <button className="inline-flex items-center gap-1 rounded-full border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50" onClick={() => exportFile("csv")}><Download size={13} /> CSV</button>
+            <button className="inline-flex items-center gap-1 rounded-full border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50" onClick={() => exportFile("excel")}><FileSpreadsheet size={13} /> Excel</button>
           </div>
         </div>
       </div>
@@ -1870,27 +2341,27 @@ function HistoryView({
         <div className="sticky top-16 z-20 rounded-[22px] border border-emerald-100 bg-white/95 p-3 shadow-soft backdrop-blur lg:top-20 lg:rounded-lg">
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
-              <p className="text-sm font-black text-slate-950">{selectedCount} dipilih</p>
+              <p className="text-sm font-semibold text-slate-950">{selectedCount} dipilih</p>
               <p className="mt-0.5 truncate text-[11px] font-semibold text-slate-500">Tap transaksi lain untuk tambah pilihan.</p>
             </div>
             <div className="flex shrink-0 items-center gap-2">
               <button
                 type="button"
-                className="rounded-full border border-slate-200 px-3 py-1.5 text-xs font-black text-slate-600 transition hover:bg-slate-50"
+                className="rounded-full border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-50"
                 onClick={clearSelection}
               >
                 Batal
               </button>
               <button
                 type="button"
-                className="rounded-full border border-emerald-100 bg-emerald-50 px-3 py-1.5 text-xs font-black text-[#00b817] transition hover:bg-emerald-100"
+                className="rounded-full border border-emerald-100 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-[#00b817] transition hover:bg-emerald-100"
                 onClick={allVisibleSelected ? clearSelection : selectAllVisible}
               >
                 {allVisibleSelected ? "Batal semua" : "Pilih semua"}
               </button>
               <button
                 type="button"
-                className="inline-flex items-center gap-1 rounded-full bg-rose-500 px-3 py-1.5 text-xs font-black text-white transition hover:bg-rose-600"
+                className="inline-flex items-center gap-1 rounded-full bg-rose-500 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-rose-600"
                 onClick={deleteSelected}
               >
                 <Trash2 size={13} /> Hapus
@@ -1902,7 +2373,7 @@ function HistoryView({
 
       {!loading && rows.length > 0 && selectedCount === 0 && (
         <div className="overflow-x-auto rounded-[20px] border border-white/80 bg-white/85 px-3 py-2 shadow-soft backdrop-blur lg:rounded-lg">
-          <div className="flex min-w-max items-center gap-2 text-[11px] font-black text-slate-500">
+          <div className="flex min-w-max items-center gap-2 text-[11px] font-semibold text-slate-500">
             <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1 text-[#00b817]">
               <ChevronRight size={12} /> Tap detail
             </span>
@@ -1922,10 +2393,10 @@ function HistoryView({
             <section key={group.key} className="overflow-hidden rounded-[24px] border border-white/80 bg-white shadow-soft lg:rounded-lg lg:border-slate-200">
               <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
                 <div>
-                  <h3 className="text-sm font-black text-slate-950">{group.label}</h3>
+                  <h3 className="text-sm font-semibold text-slate-950">{group.label}</h3>
                   <p className="text-xs font-semibold text-slate-500">{group.rows.length} transaksi</p>
                 </div>
-                <p className={`text-sm font-black ${group.net >= 0 ? "text-[#00b817]" : "text-slate-900"}`}>
+                <p className={`text-sm font-semibold ${group.net >= 0 ? "text-[#00b817]" : "text-slate-900"}`}>
                   {group.net >= 0 ? "+" : "-"}{rupiah(Math.abs(group.net))}
                 </p>
               </div>
@@ -1962,7 +2433,7 @@ function HistoryView({
   );
 }
 
-type ManageTab = "budgets" | "accounts" | "categories";
+type ManageTab = "budgets" | "accounts" | "categories" | "schedules";
 type BudgetRow = {
   id: string;
   categoryId: string;
@@ -2001,7 +2472,7 @@ function SectionHeader({ title, caption, action }: { title: string; caption?: st
   return (
     <div className="mb-3 flex items-start justify-between gap-3">
       <div className="min-w-0">
-        <h3 className="text-sm font-black text-slate-950">{title}</h3>
+        <h3 className="text-sm font-semibold text-slate-950">{title}</h3>
         {caption && <p className="mt-0.5 text-xs font-semibold text-slate-500">{caption}</p>}
       </div>
       {action}
@@ -2013,11 +2484,13 @@ function ManageView({
   accounts,
   categories,
   request,
+  onNavigate,
   onChanged
 }: {
   accounts: Account[];
   categories: Category[];
   request: <T>(path: string, options?: RequestInit) => Promise<T>;
+  onNavigate: (view: View) => void;
   onChanged: () => Promise<void>;
 }) {
   const [activeTab, setActiveTab] = useState<ManageTab>("budgets");
@@ -2029,24 +2502,25 @@ function ManageView({
   const tabs: Array<{ id: ManageTab; label: string; icon: LucideIcon; meta: string }> = [
     { id: "budgets", label: "Budget", icon: CircleDollarSign, meta: "Batas bulanan" },
     { id: "accounts", label: "Akun", icon: Wallet, meta: `${accounts.length} aktif` },
-    { id: "categories", label: "Kategori", icon: Tags, meta: `${expenseCategoryCount} pengeluaran` }
+    { id: "categories", label: "Kategori", icon: Tags, meta: `${expenseCategoryCount} pengeluaran` },
+    { id: "schedules", label: "Jadwal", icon: Bell, meta: "Pengingat bayar" }
   ];
 
   return (
     <section className="mx-auto max-w-6xl space-y-3 lg:space-y-5">
       <div className="grid gap-3 lg:grid-cols-[1.05fr_1.35fr]">
         <div className="rounded-[26px] bg-[#003d12] p-4 text-white shadow-[0_18px_42px_rgba(0,184,23,0.18)] lg:rounded-lg lg:p-5">
-          <p className="text-[10px] font-black uppercase text-white/60">Kelola</p>
-          <h2 className="mt-1 text-xl font-black tracking-normal">Dompet & aturan</h2>
+          <p className="text-[10px] font-semibold uppercase text-white/60">Kelola</p>
+          <h2 className="mt-1 text-xl font-semibold tracking-normal">Dompet & aturan</h2>
           <p className="mt-1 text-xs font-semibold text-white/70">Atur akun, kategori, dan batas budget dari satu tempat.</p>
           <div className="mt-4 grid grid-cols-2 gap-2">
             <div className="rounded-2xl bg-white/12 px-3 py-2 lg:rounded-md">
               <p className="text-[10px] font-bold text-white/60">Saldo akun</p>
-              <p className="mt-1 truncate text-sm font-black">{rupiah(totalBalance)}</p>
+              <p className="mt-1 truncate text-sm font-semibold">{rupiah(totalBalance)}</p>
             </div>
             <div className="rounded-2xl bg-white/12 px-3 py-2 lg:rounded-md">
               <p className="text-[10px] font-bold text-white/60">Kategori</p>
-              <p className="mt-1 truncate text-sm font-black">{categories.length} aktif</p>
+              <p className="mt-1 truncate text-sm font-semibold">{categories.length} aktif</p>
             </div>
           </div>
         </div>
@@ -2071,7 +2545,7 @@ function ManageView({
                     <Icon size={17} />
                   </span>
                   <span className="min-w-0">
-                    <span className="block text-sm font-black">{tab.label}</span>
+                    <span className="block text-sm font-semibold">{tab.label}</span>
                     <span className="mt-0.5 block truncate text-[11px] font-semibold opacity-70">{tab.meta}</span>
                   </span>
                 </span>
@@ -2085,17 +2559,291 @@ function ManageView({
       {activeTab === "budgets" && <BudgetsView categories={categories} request={request} onChanged={onChanged} />}
       {activeTab === "accounts" && <AccountsView accounts={accounts} request={request} onChanged={onChanged} />}
       {activeTab === "categories" && <CategoriesView categories={categories} request={request} onChanged={onChanged} />}
+      {activeTab === "schedules" && <SchedulesView accounts={accounts} categories={categories} request={request} onNavigate={onNavigate} onTransfer={() => setActiveTab("accounts")} />}
     </section>
+  );
+}
+
+function scheduleTone(status: Schedule["reminderStatus"]) {
+  if (status === "overdue") return "bg-rose-50 text-rose-700";
+  if (status === "soon") return "bg-amber-50 text-amber-700";
+  return "bg-emerald-50 text-[#00b817]";
+}
+
+function SchedulesView({
+  accounts,
+  categories,
+  request,
+  onNavigate,
+  onTransfer
+}: {
+  accounts: Account[];
+  categories: Category[];
+  request: <T>(path: string, options?: RequestInit) => Promise<T>;
+  onNavigate: (view: View) => void;
+  onTransfer: () => void;
+}) {
+  const [schedules, setSchedules] = useState<Schedule[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [editingSchedule, setEditingSchedule] = useState<Schedule | null>(null);
+  const [scheduleView, setScheduleView] = useState<"list" | "form">("list");
+  const expenseCategories = categories.filter((category) => category.categoryType === "expense");
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      setSchedules(await request<Schedule[]>("/schedules"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load().catch(console.error); }, []);
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setError(null);
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    try {
+      await request(editingSchedule ? `/schedules/${editingSchedule.id}` : "/schedules", {
+        method: editingSchedule ? "PUT" : "POST",
+        body: JSON.stringify({
+          title: String(form.get("title")),
+          scheduleType: String(form.get("scheduleType")),
+          dueDay: Number(form.get("dueDay")),
+          nextDueDate: String(form.get("nextDueDate")),
+          amount: String(form.get("amount") || "") || null,
+          accountId: String(form.get("accountId") || "") || null,
+          destinationAccountId: String(form.get("destinationAccountId") || "") || null,
+          categoryId: String(form.get("categoryId") || "") || null,
+          paymentMethod: String(form.get("paymentMethod") || "") || null,
+          notes: String(form.get("notes") || "") || null
+        })
+      });
+      formElement.reset();
+      setEditingSchedule(null);
+      await load();
+      setScheduleView("list");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Jadwal gagal disimpan");
+    }
+  };
+
+  const remove = async (id: string) => {
+    if (!window.confirm("Hapus jadwal ini?")) return;
+    await request(`/schedules/${id}`, { method: "DELETE" });
+    await load();
+  };
+
+  return (
+    <div className="space-y-3">
+      {scheduleView === "list" && (
+      <section className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200">
+        <SectionHeader
+          title="Jadwal & pemberitahuan"
+          caption="Pengingat pembayaran, top up, atau transfer rutin."
+          action={(
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 text-xs font-semibold text-[#00b817]"
+              onClick={() => {
+                setError(null);
+                setEditingSchedule(null);
+                setScheduleView("form");
+              }}
+            >
+              <Plus size={14} /> Tambah
+            </button>
+          )}
+        />
+        {loading ? <LoadingState /> : schedules.length === 0 ? (
+          <EmptyState text="Belum ada jadwal. Tambahkan pengingat rutin pertama Anda." />
+        ) : (
+          <div className="grid gap-2 md:grid-cols-2">
+            {schedules.map((schedule) => (
+              <article key={schedule.id} className="rounded-2xl border border-slate-100 bg-white px-3 py-3 lg:rounded-md">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-semibold text-slate-950">{schedule.title}</p>
+                    <p className="mt-0.5 text-xs text-slate-500">
+                      {localDate(schedule.nextDueDate)} {schedule.amount ? `- ${rupiah(schedule.amount)}` : ""}
+                    </p>
+                  </div>
+                  <span className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-semibold ${scheduleTone(schedule.reminderStatus)}`}>
+                    {schedule.reminderStatus === "overdue" ? "Lewat" : schedule.reminderStatus === "soon" ? `${schedule.daysUntilDue} hari` : "Aktif"}
+                  </span>
+                </div>
+                <p className="mt-2 text-xs text-slate-500">
+                  {schedule.scheduleType === "transfer" || schedule.scheduleType === "topup"
+                    ? `${schedule.accountName ?? "Akun"} ke ${schedule.destinationAccountName ?? "tujuan"}`
+                    : `${schedule.categoryName ?? "Transaksi"} dari ${schedule.accountName ?? "akun"}`}
+                </p>
+                <div className="mt-3 grid grid-cols-[1fr_auto_auto] gap-2">
+                  <button
+                    type="button"
+                    className="rounded-full bg-emerald-50 px-3 py-2 text-xs font-semibold text-[#00b817] transition hover:bg-emerald-100"
+                    onClick={() => schedule.scheduleType === "transaction" ? onNavigate("manual") : onTransfer()}
+                  >
+                    Buat sekarang
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded-full bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-emerald-50 hover:text-[#00b817]"
+                    onClick={() => {
+                      setError(null);
+                      setEditingSchedule(schedule);
+                      setScheduleView("form");
+                    }}
+                    aria-label={`Edit jadwal ${schedule.title}`}
+                  >
+                    <Settings size={13} />
+                  </button>
+                  <button type="button" className="rounded-full bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-600" onClick={() => remove(schedule.id)}>
+                    <Trash2 size={13} />
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
+      )}
+
+      {scheduleView === "form" && (
+      <form key={editingSchedule?.id ?? "new-schedule"} className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200" onSubmit={submit}>
+        <SectionHeader
+          title={editingSchedule ? "Edit jadwal" : "Tambah jadwal"}
+          caption={editingSchedule ? "Sesuaikan pengingat dan detail transaksi terjadwal." : "Contoh: bayar SPP tiap tanggal 1 atau top up GoPay."}
+          action={(
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 text-xs font-semibold text-slate-500 hover:text-slate-900"
+              onClick={() => {
+                setEditingSchedule(null);
+                setError(null);
+                setScheduleView("list");
+              }}
+            >
+              <ArrowLeft size={14} /> Kembali
+            </button>
+          )}
+        />
+        <div className="space-y-3">
+          <Field label="Judul">
+            <input className="input" name="title" placeholder="Bayar SPP sekolah" defaultValue={editingSchedule?.title ?? ""} required />
+          </Field>
+          <div className="grid grid-cols-2 gap-2">
+            <Field label="Tipe">
+              <select className="input" name="scheduleType" defaultValue={editingSchedule?.scheduleType ?? "transaction"}>
+                <option value="transaction">Transaksi</option>
+                <option value="transfer">Transfer</option>
+                <option value="topup">Top up</option>
+              </select>
+            </Field>
+            <Field label="Tanggal rutin">
+              <input className="input" name="dueDay" type="number" min={1} max={31} defaultValue={editingSchedule?.dueDay ?? 1} required />
+            </Field>
+          </div>
+          <Field label="Jatuh tempo berikutnya">
+            <input className="input" name="nextDueDate" type="date" defaultValue={editingSchedule?.nextDueDate ? isoDateInput(new Date(editingSchedule.nextDueDate)) : isoDateInput()} required />
+          </Field>
+          <Field label="Nominal">
+            <input className="input" name="amount" inputMode="numeric" placeholder="Opsional" defaultValue={moneyInputValue(editingSchedule?.amount)} onInput={handleMoneyInput} />
+          </Field>
+          <div className="grid grid-cols-2 gap-2">
+            <Field label="Akun sumber">
+              <select className="input" name="accountId" defaultValue={editingSchedule?.accountId ?? ""}>
+                <option value="">Pilih akun</option>
+                {accounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
+              </select>
+            </Field>
+            <Field label="Akun tujuan">
+              <select className="input" name="destinationAccountId" defaultValue={editingSchedule?.destinationAccountId ?? ""}>
+                <option value="">Opsional</option>
+                {accounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
+              </select>
+            </Field>
+          </div>
+          <Field label="Kategori">
+            <select className="input" name="categoryId" defaultValue={editingSchedule?.categoryId ?? ""}>
+              <option value="">Opsional</option>
+              {expenseCategories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
+            </select>
+          </Field>
+          <input className="input" name="paymentMethod" placeholder="Metode pembayaran, misalnya BCA atau GoPay" defaultValue={editingSchedule?.paymentMethod ?? ""} />
+          <input className="input" name="notes" placeholder="Catatan singkat" defaultValue={editingSchedule?.notes ?? ""} />
+          <button className="btn-primary w-full"><Bell size={16} /> {editingSchedule ? "Simpan perubahan" : "Simpan jadwal"}</button>
+          {error && <p className="rounded-2xl bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-700 lg:rounded-md">{error}</p>}
+        </div>
+      </form>
+      )}
+    </div>
   );
 }
 
 function AccountsView({ accounts, request, onChanged }: { accounts: Account[]; request: <T>(path: string, options?: RequestInit) => Promise<T>; onChanged: () => Promise<void> }) {
   const [error, setError] = useState<string | null>(null);
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
+  const [accountView, setAccountView] = useState<"list" | "account-form" | "transfer-form">("list");
+  const [sourceAccountId, setSourceAccountId] = useState("");
+  const [destinationAccountId, setDestinationAccountId] = useState("");
+  const [transferAttachmentId, setTransferAttachmentId] = useState<string | null>(null);
+  const [transferAttachmentName, setTransferAttachmentName] = useState("");
+  const [transferAttachmentLoading, setTransferAttachmentLoading] = useState(false);
+  const [transferAttachmentMessage, setTransferAttachmentMessage] = useState<string | null>(null);
+  const sourceAccount = accounts.find((account) => account.id === sourceAccountId);
+  const destinationAccount = accounts.find((account) => account.id === destinationAccountId);
   const totalBalance = accounts.reduce(
     (sum, account) => sum + (account.accountType === "credit_card" ? -moneyValue(account.currentBalance) : moneyValue(account.currentBalance)),
     0
   );
+
+  useEffect(() => {
+    if (!accounts.length) {
+      setSourceAccountId("");
+      setDestinationAccountId("");
+      return;
+    }
+
+    setSourceAccountId((current) => accounts.some((account) => account.id === current) ? current : accounts[0].id);
+    setDestinationAccountId((current) => {
+      if (accounts.some((account) => account.id === current && account.id !== sourceAccountId)) return current;
+      return accounts.find((account) => account.id !== sourceAccountId)?.id ?? accounts[0].id;
+    });
+  }, [accounts, sourceAccountId]);
+
+  const uploadTransferAttachment = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setTransferAttachmentLoading(true);
+    setTransferAttachmentName(file.name);
+    setTransferAttachmentMessage("Mengunggah attachment...");
+    setError(null);
+
+    try {
+      const uploadForm = new FormData();
+      uploadForm.set("receipt", file);
+      try {
+        const uploaded = await request<{ id: string }>("/receipts/upload", { method: "POST", body: uploadForm });
+        setTransferAttachmentId(uploaded.id);
+      } catch (err) {
+        const duplicateId = err instanceof ApiError && err.status === 409 && err.details && typeof err.details === "object"
+          ? String((err.details as { receiptId?: unknown }).receiptId ?? "")
+          : "";
+        if (!duplicateId) throw err;
+        setTransferAttachmentId(duplicateId);
+      }
+      setTransferAttachmentMessage("Attachment berhasil diunggah.");
+    } catch {
+      setTransferAttachmentId(null);
+      setTransferAttachmentMessage("Attachment gagal diunggah. Pastikan file berupa gambar atau video.");
+    } finally {
+      setTransferAttachmentLoading(false);
+      event.target.value = "";
+    }
+  };
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -2119,6 +2867,7 @@ function AccountsView({ accounts, request, onChanged }: { accounts: Account[]; r
       formElement.reset();
       setEditingAccount(null);
       await onChanged();
+      setAccountView("list");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Akun gagal disimpan");
     }
@@ -2136,21 +2885,55 @@ function AccountsView({ accounts, request, onChanged }: { accounts: Account[]; r
           sourceAccountId: String(form.get("sourceAccountId")),
           destinationAccountId: String(form.get("destinationAccountId")),
           amount: String(form.get("amount")),
+          feeAmount: String(form.get("feeAmount") || "0"),
           transferDate: new Date(String(form.get("transferDate"))).toISOString(),
-          notes: String(form.get("notes") || "") || null
+          notes: String(form.get("notes") || "") || null,
+          receiptId: transferAttachmentId
         })
       });
       formElement.reset();
+      setTransferAttachmentId(null);
+      setTransferAttachmentName("");
+      setTransferAttachmentMessage(null);
       await onChanged();
+      setAccountView("list");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Transfer gagal");
     }
   };
 
   return (
-    <div className="grid gap-3 xl:grid-cols-[1.1fr_0.9fr]">
-      <section className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200">
-        <SectionHeader title="Akun & saldo" caption={`${accounts.length} akun aktif - total ${rupiah(totalBalance)}`} />
+    <div className="space-y-3">
+      {accountView === "list" && (
+        <section className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200">
+        <SectionHeader
+          title="Akun & saldo"
+          caption={`${accounts.length} akun aktif - total ${rupiah(totalBalance)}`}
+          action={(
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 text-xs font-semibold text-[#00b817]"
+              onClick={() => {
+                setError(null);
+                setEditingAccount(null);
+                setAccountView("account-form");
+              }}
+            >
+              <Plus size={14} /> Tambah
+            </button>
+          )}
+        />
+        <button
+          type="button"
+          className="btn-primary mb-3 w-full"
+          disabled={accounts.length < 2}
+          onClick={() => {
+            setError(null);
+            setAccountView("transfer-form");
+          }}
+        >
+          <ArrowLeftRight size={16} /> Transfer saldo
+        </button>
         {accounts.length === 0 ? (
           <EmptyState text="Belum ada akun. Tambahkan kas, rekening, atau e-wallet pertama Anda." />
         ) : (
@@ -2159,22 +2942,23 @@ function AccountsView({ accounts, request, onChanged }: { accounts: Account[]; r
               <div key={account.id} className="rounded-2xl border border-slate-100 bg-white px-3 py-3 lg:rounded-md">
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
-                    <p className="truncate text-sm font-black text-slate-950">{account.name}</p>
+                    <p className="truncate text-sm font-semibold text-slate-950">{account.name}</p>
                     <p className="mt-0.5 text-xs font-semibold text-slate-500">{accountTypeLabel(account.accountType)}</p>
                   </div>
                   <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl bg-emerald-50 text-[#00b817] lg:rounded-md">
                     <CreditCard size={16} />
                   </span>
                 </div>
-                <p className="mt-3 text-lg font-black tracking-normal text-slate-950">{rupiah(account.currentBalance)}</p>
+                <p className="mt-3 text-lg font-semibold tracking-normal text-slate-950">{rupiah(account.currentBalance)}</p>
                 <div className="mt-1 flex items-center justify-between gap-2">
                   <p className="text-[11px] font-semibold text-slate-500">Saldo awal {rupiah(account.initialBalance)}</p>
                   <button
                     type="button"
-                    className="inline-flex items-center gap-1 rounded-full bg-slate-50 px-2 py-1 text-[11px] font-black text-slate-600 transition hover:bg-emerald-50 hover:text-[#00b817]"
+                    className="inline-flex items-center gap-1 rounded-full bg-slate-50 px-2 py-1 text-[11px] font-semibold text-slate-600 transition hover:bg-emerald-50 hover:text-[#00b817]"
                     onClick={() => {
                       setError(null);
                       setEditingAccount(account);
+                      setAccountView("account-form");
                     }}
                   >
                     <Settings size={12} /> Edit
@@ -2184,18 +2968,27 @@ function AccountsView({ accounts, request, onChanged }: { accounts: Account[]; r
             ))}
           </div>
         )}
-      </section>
+        </section>
+      )}
 
-      <aside className="space-y-3">
+      {accountView === "account-form" && (
         <form key={editingAccount?.id ?? "new-account"} className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200" onSubmit={submit}>
           <SectionHeader
             title={editingAccount ? "Edit akun" : "Tambah akun"}
             caption={editingAccount ? "Ubah nama, tipe, atau aturan saldo minus." : "Pisahkan kas, rekening, e-wallet, atau kartu kredit."}
-            action={editingAccount ? (
-              <button type="button" className="text-xs font-black text-slate-500 hover:text-slate-900" onClick={() => setEditingAccount(null)}>
-                Batal
+            action={(
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 text-xs font-semibold text-slate-500 hover:text-slate-900"
+                onClick={() => {
+                  setEditingAccount(null);
+                  setError(null);
+                  setAccountView("list");
+                }}
+              >
+                <ArrowLeft size={14} /> Kembali
               </button>
-            ) : undefined}
+            )}
           />
           <div className="space-y-3">
             <Field label="Nama akun">
@@ -2216,7 +3009,7 @@ function AccountsView({ accounts, request, onChanged }: { accounts: Account[]; r
               </p>
             ) : (
               <Field label="Saldo awal">
-                <input className="input" name="initialBalance" inputMode="decimal" placeholder="Contoh: 500000" required />
+                <input className="input" name="initialBalance" inputMode="numeric" placeholder="Contoh: 500000" onInput={handleMoneyInput} required />
               </Field>
             )}
             <label className="flex items-start gap-2 rounded-2xl bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-600 lg:rounded-md">
@@ -2226,30 +3019,122 @@ function AccountsView({ accounts, request, onChanged }: { accounts: Account[]; r
             <button className="btn-primary w-full">{editingAccount ? <CheckCircle2 size={16} /> : <Plus size={16} />} {editingAccount ? "Simpan perubahan" : "Simpan akun"}</button>
           </div>
         </form>
+      )}
 
+      {accountView === "transfer-form" && (
         <form className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200" onSubmit={transfer}>
-          <SectionHeader title="Transfer saldo" caption="Pindahkan uang antar akun tanpa membuat pengeluaran." />
+          <SectionHeader
+            title="Transfer saldo"
+            caption="Pindahkan uang antar akun tanpa membuat pengeluaran."
+            action={(
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 text-xs font-semibold text-slate-500 hover:text-slate-900"
+                onClick={() => {
+                  setError(null);
+                  setAccountView("list");
+                }}
+              >
+                <ArrowLeft size={14} /> Kembali
+              </button>
+            )}
+          />
           <div className="space-y-3">
             <Field label="Dari akun">
-              <select className="input" name="sourceAccountId" required disabled={accounts.length < 2}>{accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}</select>
+              <div>
+                <select
+                  className="input"
+                  name="sourceAccountId"
+                  value={sourceAccountId}
+                  onChange={(event) => {
+                    const nextSourceId = event.target.value;
+                    setSourceAccountId(nextSourceId);
+                    if (destinationAccountId === nextSourceId) {
+                      setDestinationAccountId(accounts.find((account) => account.id !== nextSourceId)?.id ?? "");
+                    }
+                  }}
+                  required
+                  disabled={accounts.length < 2}
+                >
+                  {accounts.map((account) => <option key={account.id} value={account.id}>{account.name} - {rupiah(account.currentBalance)}</option>)}
+                </select>
+                {sourceAccount && (
+                  <div className="mt-1.5 flex items-center justify-between px-1 text-xs text-slate-500">
+                    <span>Saldo tersedia</span>
+                    <span className="font-semibold text-slate-900">{rupiah(sourceAccount.currentBalance)}</span>
+                  </div>
+                )}
+              </div>
             </Field>
             <Field label="Ke akun">
-              <select className="input" name="destinationAccountId" required disabled={accounts.length < 2}>{accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}</select>
+              <div>
+                <select
+                  className="input"
+                  name="destinationAccountId"
+                  value={destinationAccountId}
+                  onChange={(event) => setDestinationAccountId(event.target.value)}
+                  required
+                  disabled={accounts.length < 2}
+                >
+                  {accounts.filter((account) => account.id !== sourceAccountId).map((account) => (
+                    <option key={account.id} value={account.id}>{account.name} - {rupiah(account.currentBalance)}</option>
+                  ))}
+                </select>
+                {destinationAccount && (
+                  <div className="mt-1.5 flex items-center justify-between px-1 text-xs text-slate-500">
+                    <span>Saldo saat ini</span>
+                    <span className="font-semibold text-slate-900">{rupiah(destinationAccount.currentBalance)}</span>
+                  </div>
+                )}
+              </div>
             </Field>
             <div className="grid grid-cols-2 gap-2">
               <Field label="Nominal">
-                <input className="input" name="amount" inputMode="decimal" placeholder="100000" required />
+                <input className="input" name="amount" inputMode="numeric" placeholder="100000" onInput={handleMoneyInput} required />
               </Field>
               <Field label="Tanggal">
                 <input className="input" name="transferDate" type="date" defaultValue={isoDateInput()} required />
               </Field>
             </div>
+            <Field label="Fee/admin">
+              <input className="input" name="feeAmount" inputMode="numeric" placeholder="Opsional, contoh: 2500" onInput={handleMoneyInput} />
+            </Field>
+            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 lg:rounded-md">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold text-slate-700">Attachment transfer</p>
+                  <p className="mt-0.5 text-[11px] leading-4 text-slate-500">Tambahkan gambar atau video sebagai bukti transfer.</p>
+                </div>
+                <label className="inline-flex shrink-0 cursor-pointer items-center gap-1.5 rounded-xl bg-white px-3 py-2 text-xs font-semibold text-[#00b817] shadow-sm ring-1 ring-slate-200 transition hover:bg-emerald-50 lg:rounded-md">
+                  {transferAttachmentLoading ? <Loader2 className="animate-spin" size={14} /> : <Upload size={14} />}
+                  {transferAttachmentId ? "Ganti" : "Pilih file"}
+                  <input
+                    className="sr-only"
+                    type="file"
+                    accept="image/*,video/*,.heic,.heif"
+                    onChange={uploadTransferAttachment}
+                    disabled={transferAttachmentLoading}
+                  />
+                </label>
+              </div>
+              {transferAttachmentName && (
+                <div className="mt-2 flex items-center gap-2 rounded-xl bg-white px-3 py-2 text-xs text-slate-600 lg:rounded-md">
+                  <ReceiptText className="shrink-0 text-[#00b817]" size={14} />
+                  <span className="truncate">{transferAttachmentName}</span>
+                </div>
+              )}
+              {transferAttachmentMessage && (
+                <p className={`mt-2 text-[11px] leading-4 ${transferAttachmentMessage.includes("berhasil") ? "text-[#008f12]" : "text-slate-500"}`}>
+                  {transferAttachmentMessage}
+                </p>
+              )}
+            </div>
             <input className="input" name="notes" placeholder="Catatan transfer (opsional)" />
-            <button className="btn-secondary w-full" disabled={accounts.length < 2}><ArrowLeftRight size={16} /> Transfer</button>
+            <button className="btn-secondary w-full" disabled={accounts.length < 2 || transferAttachmentLoading}><ArrowLeftRight size={16} /> Transfer</button>
           </div>
         </form>
-        {error && <p className="rounded-2xl bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-700 lg:rounded-md">{error}</p>}
-      </aside>
+      )}
+      {error && <p className="rounded-2xl bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-700 lg:rounded-md">{error}</p>}
     </div>
   );
 }
@@ -2257,6 +3142,7 @@ function AccountsView({ accounts, request, onChanged }: { accounts: Account[]; r
 function CategoriesView({ categories, request, onChanged }: { categories: Category[]; request: <T>(path: string, options?: RequestInit) => Promise<T>; onChanged: () => Promise<void> }) {
   const [error, setError] = useState<string | null>(null);
   const [editingCategory, setEditingCategory] = useState<Category | null>(null);
+  const [categoryView, setCategoryView] = useState<"list" | "form">("list");
   const expenseCategories = categories.filter((category) => category.categoryType === "expense");
   const incomeCategories = categories.filter((category) => category.categoryType === "income");
 
@@ -2277,36 +3163,66 @@ function CategoriesView({ categories, request, onChanged }: { categories: Catego
       formElement.reset();
       setEditingCategory(null);
       await onChanged();
+      setCategoryView("list");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Kategori gagal disimpan");
     }
   };
 
   return (
-    <div className="grid gap-3 xl:grid-cols-[1.15fr_0.85fr]">
+    <div className="space-y-3">
+      {categoryView === "list" && (
       <section className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200">
-        <SectionHeader title="Kategori transaksi" caption={`${expenseCategories.length} pengeluaran - ${incomeCategories.length} pemasukan`} />
+        <SectionHeader
+          title="Kategori transaksi"
+          caption={`${expenseCategories.length} pengeluaran - ${incomeCategories.length} pemasukan`}
+          action={(
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 text-xs font-semibold text-[#00b817]"
+              onClick={() => {
+                setError(null);
+                setEditingCategory(null);
+                setCategoryView("form");
+              }}
+            >
+              <Plus size={14} /> Tambah
+            </button>
+          )}
+        />
         <div className="space-y-4">
           <CategoryGroup title="Pengeluaran" rows={expenseCategories} tone="expense" onEdit={(category) => {
             setError(null);
             setEditingCategory(category);
+            setCategoryView("form");
           }} />
           <CategoryGroup title="Pemasukan" rows={incomeCategories} tone="income" onEdit={(category) => {
             setError(null);
             setEditingCategory(category);
+            setCategoryView("form");
           }} />
         </div>
       </section>
+      )}
 
+      {categoryView === "form" && (
       <form key={editingCategory?.id ?? "new-category"} className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200" onSubmit={submit}>
         <SectionHeader
           title={editingCategory ? "Edit kategori" : "Kategori baru"}
           caption={editingCategory ? "Ubah nama atau tipe kategori transaksi." : "Buat kategori yang mudah dipilih oleh AI dan form manual."}
-          action={editingCategory ? (
-            <button type="button" className="text-xs font-black text-slate-500 hover:text-slate-900" onClick={() => setEditingCategory(null)}>
-              Batal
+          action={(
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 text-xs font-semibold text-slate-500 hover:text-slate-900"
+              onClick={() => {
+                setEditingCategory(null);
+                setError(null);
+                setCategoryView("list");
+              }}
+            >
+              <ArrowLeft size={14} /> Kembali
             </button>
-          ) : undefined}
+          )}
         />
         <div className="space-y-3">
           <Field label="Nama kategori">
@@ -2322,6 +3238,7 @@ function CategoriesView({ categories, request, onChanged }: { categories: Catego
           {error && <p className="rounded-2xl bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-700 lg:rounded-md">{error}</p>}
         </div>
       </form>
+      )}
     </div>
   );
 }
@@ -2331,7 +3248,7 @@ function CategoryGroup({ title, rows, tone, onEdit }: { title: string; rows: Cat
   return (
     <div>
       <div className="mb-2 flex items-center justify-between">
-        <p className="text-xs font-black text-slate-500">{title}</p>
+        <p className="text-xs font-semibold text-slate-500">{title}</p>
         <span className="text-[11px] font-bold text-slate-400">{rows.length} kategori</span>
       </div>
       {rows.length === 0 ? (
@@ -2345,13 +3262,13 @@ function CategoryGroup({ title, rows, tone, onEdit }: { title: string; rows: Cat
                   <Tags size={15} />
                 </span>
                 <div className="min-w-0">
-                  <p className="truncate text-sm font-black text-slate-950">{category.name}</p>
+                  <p className="truncate text-sm font-semibold text-slate-950">{category.name}</p>
                   <p className="text-[11px] font-semibold text-slate-500">{category.isDefault ? "Default" : "Custom"}</p>
                 </div>
               </div>
               <button
                 type="button"
-                className="inline-flex shrink-0 items-center gap-1 rounded-full bg-slate-50 px-2 py-1 text-[11px] font-black text-slate-600 transition hover:bg-emerald-50 hover:text-[#00b817]"
+                className="inline-flex shrink-0 items-center gap-1 rounded-full bg-slate-50 px-2 py-1 text-[11px] font-semibold text-slate-600 transition hover:bg-emerald-50 hover:text-[#00b817]"
                 onClick={() => onEdit?.(category)}
               >
                 <Settings size={12} /> Edit
@@ -2415,6 +3332,7 @@ function BudgetsView({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [editingBudget, setEditingBudget] = useState<BudgetRow | null>(null);
+  const [budgetView, setBudgetView] = useState<"list" | "form">("list");
   const expenseCategories = categories.filter((category) => category.categoryType === "expense");
   const load = async () => {
     setLoading(true);
@@ -2446,6 +3364,7 @@ function BudgetsView({
       setEditingBudget(null);
       await load();
       await onChanged?.();
+      setBudgetView("list");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Anggaran gagal disimpan");
     }
@@ -2458,12 +3377,25 @@ function BudgetsView({
   const sortedBudgets = [...budgets].sort((a, b) => moneyValue(b.usagePercent) - moneyValue(a.usagePercent));
 
   return (
-    <div className="grid gap-3 xl:grid-cols-[1.15fr_0.85fr]">
+    <div className="space-y-3">
+      {budgetView === "list" && (
       <section className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200">
         <SectionHeader
           title="Budget bulan ini"
           caption={budgets.length > 0 ? `${budgets.length} kategori dipantau - ${totalPercent}% terpakai` : "Belum ada batas pengeluaran"}
-          action={<span className="rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-black text-[#00b817]">{rupiah(totalUsed)}</span>}
+          action={(
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 text-xs font-semibold text-[#00b817]"
+              onClick={() => {
+                setError(null);
+                setEditingBudget(null);
+                setBudgetView("form");
+              }}
+            >
+              <Plus size={14} /> Tambah
+            </button>
+          )}
         />
         <div className="mb-4 h-2 overflow-hidden rounded-full bg-slate-100">
           <div
@@ -2483,15 +3415,15 @@ function BudgetsView({
                 <div key={budget.id} className="rounded-2xl border border-slate-100 bg-white px-3 py-3 lg:rounded-md">
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <p className="truncate text-sm font-black text-slate-950">{budget.category}</p>
+                      <p className="truncate text-sm font-semibold text-slate-950">{budget.category}</p>
                       <p className="mt-0.5 text-xs font-semibold text-slate-500">Sisa {rupiah(budget.remaining)}</p>
                     </div>
-                    <span className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-black ${budgetTone(budget.status)}`}>
+                    <span className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-semibold ${budgetTone(budget.status)}`}>
                       {budget.status}
                     </span>
                   </div>
                   <div className="mt-3 flex items-end justify-between gap-3">
-                    <p className="text-base font-black text-slate-950">{rupiah(budget.used)}</p>
+                    <p className="text-base font-semibold text-slate-950">{rupiah(budget.used)}</p>
                     <p className="text-xs font-bold text-slate-500">/ {rupiah(budget.budgetAmount)}</p>
                   </div>
                   <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-100">
@@ -2503,15 +3435,16 @@ function BudgetsView({
                   <div className="mt-2 flex items-center justify-between gap-2">
                     <button
                       type="button"
-                      className="inline-flex items-center gap-1 rounded-full bg-slate-50 px-2 py-1 text-[11px] font-black text-slate-600 transition hover:bg-emerald-50 hover:text-[#00b817]"
+                      className="inline-flex items-center gap-1 rounded-full bg-slate-50 px-2 py-1 text-[11px] font-semibold text-slate-600 transition hover:bg-emerald-50 hover:text-[#00b817]"
                       onClick={() => {
                         setError(null);
                         setEditingBudget(budget);
+                        setBudgetView("form");
                       }}
                     >
                       <Settings size={12} /> Edit
                     </button>
-                    <p className="text-[11px] font-black text-slate-400">{percent}%</p>
+                    <p className="text-[11px] font-semibold text-slate-400">{percent}%</p>
                   </div>
                 </div>
               );
@@ -2519,16 +3452,26 @@ function BudgetsView({
           </div>
         )}
       </section>
+      )}
 
+      {budgetView === "form" && (
       <form key={editingBudget?.id ?? "new-budget"} className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200" onSubmit={submit}>
         <SectionHeader
           title={editingBudget ? "Edit budget" : "Atur budget"}
           caption={editingBudget ? "Sesuaikan kategori, periode, atau batas nominal." : "Pilih kategori pengeluaran, periode, lalu isi batas nominal."}
-          action={editingBudget ? (
-            <button type="button" className="text-xs font-black text-slate-500 hover:text-slate-900" onClick={() => setEditingBudget(null)}>
-              Batal
+          action={(
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 text-xs font-semibold text-slate-500 hover:text-slate-900"
+              onClick={() => {
+                setEditingBudget(null);
+                setError(null);
+                setBudgetView("list");
+              }}
+            >
+              <ArrowLeft size={14} /> Kembali
             </button>
-          ) : undefined}
+          )}
         />
         <div className="space-y-3">
           <Field label="Kategori">
@@ -2545,13 +3488,14 @@ function BudgetsView({
             </Field>
           </div>
           <Field label="Nilai budget">
-            <input className="input" name="budgetAmount" inputMode="decimal" placeholder="Contoh: 1000000" defaultValue={editingBudget?.budgetAmount ?? ""} required />
+            <input className="input" name="budgetAmount" inputMode="numeric" placeholder="Contoh: 1000000" defaultValue={moneyInputValue(editingBudget?.budgetAmount)} onInput={handleMoneyInput} required />
           </Field>
           <button className="btn-primary w-full" disabled={expenseCategories.length === 0}><CheckCircle2 size={16} /> {editingBudget ? "Simpan perubahan" : "Simpan budget"}</button>
           {expenseCategories.length === 0 && <p className="text-xs font-semibold text-slate-500">Buat kategori pengeluaran dulu sebelum menambahkan budget.</p>}
           {error && <p className="rounded-2xl bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-700 lg:rounded-md">{error}</p>}
         </div>
       </form>
+      )}
     </div>
   );
 }
@@ -2678,11 +3622,11 @@ function ReportsView({ request }: { request: <T>(path: string, options?: Request
       <div className="rounded-[26px] bg-[#003d12] p-4 text-white shadow-[0_18px_42px_rgba(0,184,23,0.20)] lg:rounded-lg lg:p-5">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <p className="text-[10px] font-black uppercase text-white/60">Insight</p>
-            <h2 className="mt-1 text-xl font-black tracking-normal">Laporan keuangan</h2>
+            <p className="text-[10px] font-semibold uppercase text-white/60">Insight</p>
+            <h2 className="mt-1 text-xl font-semibold tracking-normal">Laporan keuangan</h2>
             <p className="mt-1 text-xs font-semibold text-white/70">Ringkasan dari transaksi bulan berjalan dan perbandingan bulanan.</p>
           </div>
-          <span className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-black ${
+          <span className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-semibold ${
             totalNet >= 0 ? "bg-emerald-50 text-[#00b817]" : "bg-rose-50 text-rose-700"
           }`}>
             {totalNet >= 0 ? "Surplus" : "Defisit"}
@@ -2691,15 +3635,15 @@ function ReportsView({ request }: { request: <T>(path: string, options?: Request
         <div className="mt-4 grid grid-cols-3 gap-2">
           <div className="rounded-2xl bg-white/12 px-3 py-2 lg:rounded-md">
             <p className="text-[10px] font-bold text-white/60">Masuk</p>
-            <p className="mt-1 truncate text-sm font-black">{rupiah(totalIncome)}</p>
+            <p className="mt-1 truncate text-sm font-semibold">{rupiah(totalIncome)}</p>
           </div>
           <div className="rounded-2xl bg-white/12 px-3 py-2 lg:rounded-md">
             <p className="text-[10px] font-bold text-white/60">Keluar</p>
-            <p className="mt-1 truncate text-sm font-black">{rupiah(totalExpense)}</p>
+            <p className="mt-1 truncate text-sm font-semibold">{rupiah(totalExpense)}</p>
           </div>
           <div className="rounded-2xl bg-white/12 px-3 py-2 lg:rounded-md">
             <p className="text-[10px] font-bold text-white/60">Net</p>
-            <p className="mt-1 truncate text-sm font-black">{totalNet >= 0 ? "+" : "-"}{rupiah(Math.abs(totalNet))}</p>
+            <p className="mt-1 truncate text-sm font-semibold">{totalNet >= 0 ? "+" : "-"}{rupiah(Math.abs(totalNet))}</p>
           </div>
         </div>
       </div>
@@ -2739,10 +3683,10 @@ function ReportsView({ request }: { request: <T>(path: string, options?: Request
         <section className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200">
           <div className="mb-3 flex items-center justify-between gap-3">
             <div>
-              <h3 className="text-sm font-black text-slate-950">Arus kas</h3>
+              <h3 className="text-sm font-semibold text-slate-950">Arus kas</h3>
               <p className="text-xs font-semibold text-slate-500">{cashFlow.length} hari tercatat</p>
             </div>
-            <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-black text-[#00b817]">Harian</span>
+            <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-[#00b817]">Harian</span>
           </div>
           <CashFlowInsightList rows={cashFlow} />
         </section>
@@ -2750,10 +3694,10 @@ function ReportsView({ request }: { request: <T>(path: string, options?: Request
         <section className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200">
           <div className="mb-3 flex items-center justify-between gap-3">
             <div>
-              <h3 className="text-sm font-black text-slate-950">Kategori</h3>
+              <h3 className="text-sm font-semibold text-slate-950">Kategori</h3>
               <p className="text-xs font-semibold text-slate-500">Pengeluaran terbesar</p>
             </div>
-            <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-black text-slate-500">{expenseCategories.length} kategori</span>
+            <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-500">{expenseCategories.length} kategori</span>
           </div>
           <CategoryInsightList rows={expenseCategories} />
         </section>
@@ -2762,10 +3706,10 @@ function ReportsView({ request }: { request: <T>(path: string, options?: Request
       <section className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200">
         <div className="mb-3 flex items-center justify-between gap-3">
           <div>
-            <h3 className="text-sm font-black text-slate-950">Antarbulan</h3>
+            <h3 className="text-sm font-semibold text-slate-950">Antarbulan</h3>
             <p className="text-xs font-semibold text-slate-500">Masuk, keluar, dan net per bulan</p>
           </div>
-          <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-black text-slate-500">{months.length} bulan</span>
+          <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-500">{months.length} bulan</span>
         </div>
         <MonthlyInsightList rows={months} />
       </section>
@@ -2797,7 +3741,7 @@ function ReportInsightCard({
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
           <p className="text-[11px] font-bold leading-tight text-slate-400">{label}</p>
-          <p className="mt-1 truncate text-sm font-black text-slate-950">{value}</p>
+          <p className="mt-1 truncate text-sm font-semibold text-slate-950">{value}</p>
         </div>
         <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-2xl lg:rounded-md ${toneClass}`}>{icon}</span>
       </div>
@@ -2822,12 +3766,12 @@ function CashFlowInsightList({ rows }: { rows: CashFlowReportRow[] }) {
           <div key={row.date} className="rounded-2xl border border-slate-100 bg-white px-3 py-2.5 lg:rounded-md">
             <div className="flex items-center justify-between gap-3">
               <div>
-                <p className="text-xs font-black text-slate-950">{localDate(row.date)}</p>
+                <p className="text-xs font-semibold text-slate-950">{localDate(row.date)}</p>
                 <p className="mt-0.5 text-[11px] font-semibold text-slate-500">Net {net >= 0 ? "+" : "-"}{rupiah(Math.abs(net))}</p>
               </div>
               <div className="shrink-0 text-right">
-                <p className="text-[11px] font-black text-[#00b817]">{rupiah(row.income)}</p>
-                <p className="text-[11px] font-black text-rose-500">{rupiah(row.expense)}</p>
+                <p className="text-[11px] font-semibold text-[#00b817]">{rupiah(row.income)}</p>
+                <p className="text-[11px] font-semibold text-rose-500">{rupiah(row.expense)}</p>
               </div>
             </div>
             <div className="mt-2 grid grid-cols-2 gap-1">
@@ -2860,10 +3804,10 @@ function CategoryInsightList({ rows }: { rows: CategoryReportRow[] }) {
             <div className="flex items-center justify-between gap-3">
               <div className="flex min-w-0 items-center gap-2">
                 <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: categoryPalette[index % categoryPalette.length] }} />
-                <span className="truncate text-xs font-black text-slate-950">{row.category ?? "Tanpa kategori"}</span>
+                <span className="truncate text-xs font-semibold text-slate-950">{row.category ?? "Tanpa kategori"}</span>
                 <span className="shrink-0 text-[10px] font-bold text-slate-400">{row.count}x</span>
               </div>
-              <span className="shrink-0 text-xs font-black text-slate-900">{rupiah(row.total)}</span>
+              <span className="shrink-0 text-xs font-semibold text-slate-900">{rupiah(row.total)}</span>
             </div>
             <div className="h-2 overflow-hidden rounded-full bg-slate-100">
               <div
@@ -2895,10 +3839,10 @@ function MonthlyInsightList({ rows }: { rows: MonthlyReportRow[] }) {
           <div key={row.month} className="rounded-2xl border border-slate-100 bg-white p-3 lg:rounded-md">
             <div className="flex items-start justify-between gap-3">
               <div>
-                <p className="text-xs font-black text-slate-950">{monthYearLabel(row.month)}</p>
+                <p className="text-xs font-semibold text-slate-950">{monthYearLabel(row.month)}</p>
                 <p className="mt-0.5 text-[11px] font-semibold text-slate-500">Ringkasan bulanan</p>
               </div>
-              <span className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-black ${
+              <span className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-semibold ${
                 net >= 0 ? "bg-emerald-50 text-[#00b817]" : "bg-rose-50 text-rose-600"
               }`}>
                 {net >= 0 ? "Surplus" : "Defisit"}
@@ -2907,16 +3851,16 @@ function MonthlyInsightList({ rows }: { rows: MonthlyReportRow[] }) {
 
             <div className="mt-3 grid grid-cols-3 gap-2">
               <div className="rounded-2xl bg-emerald-50 px-2.5 py-2 lg:rounded-md">
-                <p className="text-[10px] font-black uppercase text-[#008f12]">Masuk</p>
-                <p className="mt-1 truncate text-xs font-black text-[#00b817]">{rupiah(income)}</p>
+                <p className="text-[10px] font-semibold uppercase text-[#008f12]">Masuk</p>
+                <p className="mt-1 truncate text-xs font-semibold text-[#00b817]">{rupiah(income)}</p>
               </div>
               <div className="rounded-2xl bg-rose-50 px-2.5 py-2 lg:rounded-md">
-                <p className="text-[10px] font-black uppercase text-rose-600">Keluar</p>
-                <p className="mt-1 truncate text-xs font-black text-rose-600">{rupiah(expense)}</p>
+                <p className="text-[10px] font-semibold uppercase text-rose-600">Keluar</p>
+                <p className="mt-1 truncate text-xs font-semibold text-rose-600">{rupiah(expense)}</p>
               </div>
               <div className="rounded-2xl bg-slate-50 px-2.5 py-2 lg:rounded-md">
-                <p className="text-[10px] font-black uppercase text-slate-500">Net</p>
-                <p className={`mt-1 truncate text-xs font-black ${net >= 0 ? "text-[#00b817]" : "text-rose-600"}`}>
+                <p className="text-[10px] font-semibold uppercase text-slate-500">Net</p>
+                <p className={`mt-1 truncate text-xs font-semibold ${net >= 0 ? "text-[#00b817]" : "text-rose-600"}`}>
                   {net >= 0 ? "+" : "-"}{rupiah(Math.abs(net))}
                 </p>
               </div>
@@ -3017,7 +3961,7 @@ function AssistantView({ request }: { request: <T>(path: string, options?: Reque
             <Bot size={20} />
           </span>
           <div className="min-w-0">
-            <h2 className="text-base font-black leading-tight">Virtual Assistant</h2>
+            <h2 className="text-base font-semibold leading-tight">Virtual Assistant</h2>
             <p className="mt-0.5 truncate text-xs font-semibold text-white/75">Tanya saldo, spending, budget, atau insight singkat</p>
           </div>
         </div>
@@ -3046,7 +3990,7 @@ function AssistantView({ request }: { request: <T>(path: string, options?: Reque
                         <button
                           key={suggestion}
                           type="button"
-                          className="rounded-full border border-emerald-100 bg-white px-2.5 py-1.5 text-[11px] font-black text-[#00b817] shadow-sm transition hover:bg-emerald-50 disabled:opacity-50"
+                          className="rounded-full border border-emerald-100 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-[#00b817] shadow-sm transition hover:bg-emerald-50 disabled:opacity-50"
                           onClick={() => sendMessage(suggestion)}
                           disabled={loading}
                         >
@@ -3080,7 +4024,7 @@ function AssistantView({ request }: { request: <T>(path: string, options?: Reque
             disabled={loading}
           />
           <button
-            className="inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-2xl bg-[#00b817] px-4 text-sm font-black text-white shadow-[0_10px_22px_rgba(0,184,23,0.22)] transition hover:bg-[#009714] disabled:cursor-not-allowed disabled:opacity-60 lg:rounded-md"
+            className="inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-2xl bg-[#00b817] px-4 text-sm font-semibold text-white shadow-[0_10px_22px_rgba(0,184,23,0.22)] transition hover:bg-[#009714] disabled:cursor-not-allowed disabled:opacity-60 lg:rounded-md"
             disabled={loading}
           >
             {loading ? <Loader2 className="animate-spin" size={16} /> : <Bot size={16} />}
@@ -3095,14 +4039,88 @@ function AssistantView({ request }: { request: <T>(path: string, options?: Reque
 function ProfileView({
   session,
   request,
+  onProfileUpdated,
+  onInstall,
+  showInstall,
   onLogout
 }: {
   session: Session;
   request: <T>(path: string, options?: RequestInit) => Promise<T>;
+  onProfileUpdated: (user: Session["user"]) => void;
+  onInstall: () => Promise<void>;
+  showInstall: boolean;
   onLogout?: () => void;
 }) {
-  const [message, setMessage] = useState<string | null>(null);
-  const submit = async (event: FormEvent<HTMLFormElement>) => {
+  const [passwordMessage, setPasswordMessage] = useState<string | null>(null);
+  const [profileMessage, setProfileMessage] = useState<string | null>(null);
+  const [avatarUrl, setAvatarUrl] = useState(session.user.avatarUrl ?? "");
+
+  useEffect(() => {
+    request<Session["user"]>("/auth/profile")
+      .then((user) => {
+        onProfileUpdated(user);
+        setAvatarUrl(user.avatarUrl ?? "");
+      })
+      .catch(() => undefined);
+  }, []);
+
+  const chooseAvatar = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setProfileMessage("Foto profil harus berupa gambar.");
+      return;
+    }
+    let avatarBlob: Blob = file;
+    if (/hei[cf]/i.test(file.type) || /\.hei[cf]$/i.test(file.name)) {
+      const converted = await heic2any({ blob: file, toType: "image/jpeg", quality: 0.9 });
+      avatarBlob = Array.isArray(converted) ? converted[0] : converted;
+    }
+    const source = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(new Error("Foto gagal dibaca"));
+      reader.readAsDataURL(avatarBlob);
+    });
+    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const nextImage = new Image();
+      nextImage.onload = () => resolve(nextImage);
+      nextImage.onerror = () => reject(new Error("Foto tidak valid"));
+      nextImage.src = source;
+    });
+    const size = Math.min(512, Math.max(image.width, image.height));
+    const scale = size / Math.max(image.width, image.height);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(image.width * scale));
+    canvas.height = Math.max(1, Math.round(image.height * scale));
+    canvas.getContext("2d")?.drawImage(image, 0, 0, canvas.width, canvas.height);
+    setAvatarUrl(canvas.toDataURL("image/jpeg", 0.85));
+    setProfileMessage(null);
+    event.target.value = "";
+  };
+
+  const saveProfile = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setProfileMessage(null);
+    const form = new FormData(event.currentTarget);
+    try {
+      const user = await request<Session["user"]>("/auth/profile", {
+        method: "PUT",
+        body: JSON.stringify({
+          fullName: String(form.get("fullName")),
+          nickname: String(form.get("nickname") || "") || null,
+          title: String(form.get("title") || "") || null,
+          avatarUrl: avatarUrl || null
+        })
+      });
+      onProfileUpdated(user);
+      setProfileMessage("Profil berhasil diperbarui.");
+    } catch (err) {
+      setProfileMessage(err instanceof Error ? err.message : "Profil gagal diperbarui");
+    }
+  };
+
+  const submitPassword = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
@@ -3114,59 +4132,91 @@ function ProfileView({
           newPassword: String(form.get("newPassword"))
         })
       });
-      setMessage("Password berhasil diubah.");
+      setPasswordMessage("Password berhasil diubah.");
       formElement.reset();
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : "Password gagal diubah");
+      setPasswordMessage(err instanceof Error ? err.message : "Password gagal diubah");
     }
   };
   return (
-    <div className="mx-auto grid max-w-5xl gap-3 xl:grid-cols-[0.9fr_1.1fr]">
+    <div className="mx-auto grid max-w-5xl gap-3 xl:grid-cols-[0.85fr_1.15fr]">
       <section className="rounded-[26px] bg-[#003d12] p-4 text-white shadow-[0_18px_42px_rgba(0,184,23,0.18)] lg:rounded-lg lg:p-5">
         <div className="flex items-start gap-3">
-          <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-white/15 text-lg font-black lg:rounded-lg">
-            {session.user.fullName.slice(0, 1).toUpperCase()}
-          </span>
+          {avatarUrl ? (
+            <img className="h-14 w-14 shrink-0 rounded-2xl object-cover ring-2 ring-white/20 lg:rounded-lg" src={avatarUrl} alt="Foto profil" />
+          ) : (
+            <span className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-white/15 text-lg font-semibold lg:rounded-lg">{session.user.fullName.slice(0, 1).toUpperCase()}</span>
+          )}
           <div className="min-w-0">
-            <p className="text-[10px] font-black uppercase text-white/60">Profil</p>
-            <h2 className="mt-1 truncate text-xl font-black">{session.user.fullName}</h2>
+            <p className="text-[10px] font-semibold uppercase text-white/60">Profil</p>
+            <h2 className="mt-1 truncate text-xl font-semibold">{session.user.nickname || session.user.fullName}</h2>
+            {session.user.title && <p className="truncate text-xs text-emerald-100">{session.user.title}</p>}
             <p className="mt-0.5 truncate text-xs font-semibold text-white/70">{session.user.email}</p>
           </div>
         </div>
         <dl className="mt-5 grid grid-cols-2 gap-2 text-xs">
-          <div className="rounded-2xl bg-white/12 px-3 py-2 lg:rounded-md"><dt className="font-bold text-white/60">Mata uang</dt><dd className="mt-1 font-black">IDR</dd></div>
-          <div className="rounded-2xl bg-white/12 px-3 py-2 lg:rounded-md"><dt className="font-bold text-white/60">Akun</dt><dd className="mt-1 font-black">Aktif</dd></div>
+          <div className="rounded-2xl bg-white/12 px-3 py-2 lg:rounded-md"><dt className="font-bold text-white/60">Mata uang</dt><dd className="mt-1 font-semibold">IDR</dd></div>
+          <div className="rounded-2xl bg-white/12 px-3 py-2 lg:rounded-md"><dt className="font-bold text-white/60">Akun</dt><dd className="mt-1 font-semibold">Aktif</dd></div>
         </dl>
+        {showInstall && (
+          <button
+            type="button"
+            className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-2xl border border-white/20 bg-white/10 px-4 py-2.5 text-xs font-semibold text-white transition hover:bg-white/15 lg:rounded-md"
+            onClick={onInstall}
+          >
+            <Download size={15} /> Pasang aplikasi
+          </button>
+        )}
         {onLogout && (
           <button
             type="button"
-            className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-white px-4 py-3 text-sm font-black text-[#003d12] transition hover:bg-emerald-50 lg:hidden"
+            className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-white px-4 py-3 text-sm font-semibold text-[#003d12] transition hover:bg-emerald-50 lg:hidden"
             onClick={onLogout}
           >
             <LogOut size={16} /> Logout
           </button>
         )}
       </section>
-      <form className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200" onSubmit={submit}>
-        <SectionHeader title="Keamanan akun" caption="Ubah password secara berkala agar akun tetap aman." />
-        <div className="space-y-3">
-          <Field label="Password saat ini">
-            <input className="input" name="currentPassword" type="password" placeholder="Masukkan password lama" required />
-          </Field>
-          <Field label="Password baru">
-            <input className="input" name="newPassword" type="password" placeholder="Minimal 8 karakter" minLength={8} required />
-          </Field>
-          <button className="btn-primary w-full"><CheckCircle2 size={16} /> Simpan password</button>
-          {message && <p className="rounded-2xl bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-600 lg:rounded-md">{message}</p>}
-        </div>
-      </form>
+      <div className="space-y-3">
+        <form className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200" onSubmit={saveProfile}>
+          <SectionHeader title="Edit profil" caption="Atur identitas yang tampil di aplikasi." />
+          <div className="space-y-3">
+            <div className="flex items-center gap-3 rounded-2xl bg-slate-50 p-3 lg:rounded-md">
+              {avatarUrl ? <img className="h-12 w-12 rounded-xl object-cover" src={avatarUrl} alt="" /> : <span className="flex h-12 w-12 items-center justify-center rounded-xl bg-white text-slate-400"><UserRound size={20} /></span>}
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-semibold text-slate-700">Foto profil</p>
+                <p className="text-[11px] text-slate-500">Gambar akan dirapikan otomatis.</p>
+              </div>
+              <label className="cursor-pointer rounded-xl bg-white px-3 py-2 text-xs font-semibold text-[#00b817] shadow-sm">
+                Pilih
+                <input className="sr-only" type="file" accept="image/*,.heic,.heif" onChange={chooseAvatar} />
+              </label>
+            </div>
+            <Field label="Nama lengkap"><input className="input" name="fullName" defaultValue={session.user.fullName} required minLength={2} /></Field>
+            <Field label="Nickname"><input className="input" name="nickname" defaultValue={session.user.nickname ?? ""} placeholder="Nama panggilan" /></Field>
+            <Field label="Title"><input className="input" name="title" defaultValue={session.user.title ?? ""} placeholder="Contoh: Student, Freelancer" /></Field>
+            <button className="btn-primary w-full"><CheckCircle2 size={16} /> Simpan profil</button>
+            {profileMessage && <p className="rounded-2xl bg-slate-50 px-3 py-2 text-sm text-slate-600 lg:rounded-md">{profileMessage}</p>}
+          </div>
+        </form>
+
+        <form className="rounded-[26px] border border-white/80 bg-white p-4 shadow-soft lg:rounded-lg lg:border-slate-200" onSubmit={submitPassword}>
+          <SectionHeader title="Keamanan akun" caption="Ubah password secara berkala agar akun tetap aman." />
+          <div className="space-y-3">
+            <Field label="Password saat ini"><input className="input" name="currentPassword" type="password" placeholder="Masukkan password lama" required /></Field>
+            <Field label="Password baru"><input className="input" name="newPassword" type="password" placeholder="Minimal 8 karakter" minLength={8} required /></Field>
+            <button className="btn-secondary w-full"><CheckCircle2 size={16} /> Simpan password</button>
+            {passwordMessage && <p className="rounded-2xl bg-slate-50 px-3 py-2 text-sm text-slate-600 lg:rounded-md">{passwordMessage}</p>}
+          </div>
+        </form>
+      </div>
     </div>
   );
 }
 
 function Field({ label, children }: { label: string; children: JSX.Element }) {
   return (
-    <label className="block text-xs font-black text-slate-600">
+    <label className="block text-xs font-semibold text-slate-600">
       {label}
       <div className="mt-1">{children}</div>
     </label>
@@ -3377,7 +4427,7 @@ function TransactionHistoryItem({
           </span>
           <div className="min-w-0 flex-1">
             <div className="flex min-w-0 items-center gap-2">
-              <p className="truncate text-sm font-black text-slate-950">{transactionTitle(row)}</p>
+              <p className="truncate text-sm font-semibold text-slate-950">{transactionTitle(row)}</p>
             </div>
             <p className="mt-1 truncate text-xs font-semibold text-slate-500">
               {row.accountName}{row.paymentMethod ? ` - ${row.paymentMethod}` : ""}
@@ -3386,7 +4436,7 @@ function TransactionHistoryItem({
         </div>
         <div className="shrink-0 text-right">
           <div className="flex items-center justify-end gap-1">
-            <p className={`text-sm font-black ${isIncome ? "text-[#00b817]" : "text-slate-950"}`}>
+            <p className={`text-sm font-semibold ${isIncome ? "text-[#00b817]" : "text-slate-950"}`}>
               {isIncome ? "+" : "-"}{rupiah(row.amount)}
             </p>
             {!compact && <ChevronRight size={14} className="text-slate-300" />}
@@ -3428,7 +4478,7 @@ function LegacyTransactionList({ rows }: { rows: Transaction[] }) {
             </div>
           </div>
           <div className="shrink-0 text-right">
-            <p className={`font-black ${row.transactionType === "income" ? "text-[#00b817]" : "text-slate-950"}`}>
+            <p className={`font-semibold ${row.transactionType === "income" ? "text-[#00b817]" : "text-slate-950"}`}>
               {row.transactionType === "income" ? "+" : "-"}{rupiah(row.amount)}
             </p>
             <p className="text-xs text-slate-400">{localDate(row.transactionDate)}</p>
@@ -3452,6 +4502,7 @@ function EmptyState({ text }: { text: string }) {
 }
 
 export default App;
+
 
 
 

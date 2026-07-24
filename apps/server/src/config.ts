@@ -20,9 +20,11 @@ export const config = {
   jwtAccessExpiresIn: process.env.JWT_ACCESS_EXPIRES_IN ?? "15m",
   jwtRefreshDays: Number(process.env.JWT_REFRESH_DAYS ?? 7),
   uploadDir: process.env.UPLOAD_DIR ?? "uploads",
-  maxUploadMb: Number(process.env.MAX_UPLOAD_MB ?? 8),
+  maxUploadMb: Number(process.env.MAX_UPLOAD_MB ?? 50),
   ocrProvider: process.env.OCR_PROVIDER ?? "tesseract",
   aiProvider: process.env.AI_PROVIDER ?? "heuristic",
   openAiApiKey: process.env.OPENAI_API_KEY,
-  openAiModel: process.env.OPENAI_MODEL ?? "gpt-4.1-mini"
+  openAiModel: process.env.OPENAI_MODEL ?? "gpt-4.1-mini",
+  googleClientId: process.env.GOOGLE_CLIENT_ID,
+  appleClientId: process.env.APPLE_CLIENT_ID
 };

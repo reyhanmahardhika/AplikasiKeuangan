@@ -4,12 +4,6 @@ import multer from "multer";
 import { config } from "../config.js";
 import { badRequest } from "../utils/errors.js";
 
-const allowedMimeTypes = new Set([
-  "image/jpeg",
-  "image/png",
-  "application/pdf"
-]);
-
 const storage = multer.diskStorage({
   destination: (req, _file, cb) => {
     const userId = req.user?.id ?? "anonymous";
@@ -29,8 +23,10 @@ export const receiptUpload = multer({
     fileSize: config.maxUploadMb * 1024 * 1024
   },
   fileFilter: (_req, file, cb) => {
-    if (!allowedMimeTypes.has(file.mimetype)) {
-      cb(badRequest("Format file tidak didukung. Gunakan JPG, JPEG, PNG, atau PDF."));
+    const extension = path.extname(file.originalname).toLowerCase();
+    const isHeic = extension === ".heic" || extension === ".heif";
+    if (!file.mimetype.startsWith("image/") && !file.mimetype.startsWith("video/") && !isHeic) {
+      cb(badRequest("Format file tidak didukung. Gunakan file gambar atau video."));
       return;
     }
     cb(null, true);

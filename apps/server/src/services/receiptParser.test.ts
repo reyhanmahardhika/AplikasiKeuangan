@@ -25,3 +25,22 @@ Terima kasih
   assert.equal(parsed.items.length, 4);
   assert.equal(parsed.items[0].totalPrice, "5000.00");
 });
+
+test("separates tax, amount paid, and change from receipt total", async () => {
+  const parsed = await parseReceiptText(`
+INDOMARET
+Air Mineral 10.000
+Roti 40.000
+SUBTOTAL 50.000
+PPN 5.000
+TOTAL 55.000
+TUNAI 60.000
+KEMBALI 5.000
+`);
+
+  assert.equal(parsed.subtotal, "50000.00");
+  assert.equal(parsed.tax, "5000.00");
+  assert.equal(parsed.total, "55000.00");
+  assert.equal(parsed.amountPaid, "60000.00");
+  assert.equal(parsed.change, "5000.00");
+});

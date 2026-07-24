@@ -18,6 +18,9 @@ export type Session = {
     fullName: string;
     email: string;
     currency?: string;
+    nickname?: string | null;
+    title?: string | null;
+    avatarUrl?: string | null;
   };
   accessToken: string;
   refreshToken: string;

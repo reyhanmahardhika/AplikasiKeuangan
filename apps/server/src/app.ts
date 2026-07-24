@@ -12,6 +12,7 @@ import { categoryRoutes } from "./routes/categoryRoutes.js";
 import { dashboardRoutes } from "./routes/dashboardRoutes.js";
 import { receiptRoutes } from "./routes/receiptRoutes.js";
 import { reportRoutes } from "./routes/reportRoutes.js";
+import { scheduleRoutes } from "./routes/scheduleRoutes.js";
 import { transactionRoutes } from "./routes/transactionRoutes.js";
 import { transferRoutes } from "./routes/transferRoutes.js";
 
@@ -39,6 +40,7 @@ export function createApp() {
   app.use("/api/categories", categoryRoutes);
   app.use("/api/budgets", budgetRoutes);
   app.use("/api/transfers", transferRoutes);
+  app.use("/api/schedules", scheduleRoutes);
   app.use("/api/reports", reportRoutes);
   app.use("/api/assistant", assistantRoutes);
 

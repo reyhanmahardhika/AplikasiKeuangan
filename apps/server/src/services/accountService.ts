@@ -1,7 +1,7 @@
 import type { PoolClient } from "pg";
 import { pool, withDbTransaction, type DbClient } from "../db/pool.js";
 import { badRequest, forbidden, notFound } from "../utils/errors.js";
-import { isNegative, normalizeMoney } from "../utils/money.js";
+import { isNegative, normalizeMoney, normalizeNonNegativeMoney } from "../utils/money.js";
 import { writeAuditLog } from "./auditService.js";
 
 export type AccountRow = {
@@ -48,7 +48,7 @@ export async function createAccount(userId: string, payload: {
   allowNegative?: boolean;
   isActive?: boolean;
 }) {
-  const initialBalance = normalizeMoney(payload.initialBalance);
+  const initialBalance = normalizeNonNegativeMoney(payload.initialBalance);
   const result = await pool.query(
     `INSERT INTO accounts (user_id, name, account_type, initial_balance, current_balance, currency, allow_negative, is_active)
      VALUES ($1, $2, $3, $4, $4, $5, $6, $7)
@@ -164,10 +164,13 @@ export async function createTransfer(userId: string, payload: {
   sourceAccountId: string;
   destinationAccountId: string;
   amount: unknown;
+  feeAmount?: unknown;
   transferDate: string;
   notes?: string | null;
+  receiptId?: string | null;
 }) {
   const amount = normalizeMoney(payload.amount);
+  const feeAmount = normalizeNonNegativeMoney(payload.feeAmount ?? 0);
   if (payload.sourceAccountId === payload.destinationAccountId) {
     throw badRequest("Akun asal dan tujuan harus berbeda");
   }
@@ -175,20 +178,70 @@ export async function createTransfer(userId: string, payload: {
   return withDbTransaction(async (client) => {
     const source = await lockAccount(client, userId, payload.sourceAccountId);
     const destination = await lockAccount(client, userId, payload.destinationAccountId);
+    if (payload.receiptId) {
+      const attachment = await client.query(
+        "SELECT id FROM receipts WHERE id = $1 AND user_id = $2",
+        [payload.receiptId, userId]
+      );
+      if (!attachment.rowCount) throw badRequest("Attachment tidak ditemukan");
+    }
 
     const sourceDelta = isDebtAccount(source.account_type) ? amount : `-${amount}`;
     const destinationDelta = isDebtAccount(destination.account_type) ? `-${amount}` : amount;
     await applyAccountDelta(client, source, sourceDelta, { allowDebtAccountZeroFloor: false });
+    if (Number(feeAmount) > 0) {
+      await applyAccountDelta(client, source, isDebtAccount(source.account_type) ? feeAmount : `-${feeAmount}`, { allowDebtAccountZeroFloor: false });
+    }
     await applyAccountDelta(client, destination, destinationDelta, { allowDebtAccountZeroFloor: false });
 
     const result = await client.query(
       `INSERT INTO transfers (user_id, source_account_id, destination_account_id, amount, transfer_date, notes)
        VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, amount, transfer_date AS "transferDate", notes`,
+       RETURNING id, amount::text, transfer_date AS "transferDate", notes`,
       [userId, source.id, destination.id, amount, payload.transferDate, payload.notes ?? null]
     );
 
-    await writeAuditLog(client, { userId, action: "CREATE", entityName: "Transfer", entityId: result.rows[0].id, newValue: result.rows[0] });
-    return result.rows[0];
+    const transferId = result.rows[0].id;
+    const sourceTransaction = await client.query(
+      `INSERT INTO transactions
+       (user_id, account_id, transaction_type, transaction_date, amount, merchant_name, payment_method, notes, source_type, status, receipt_id)
+       VALUES ($1, $2, 'expense', $3, $4, $5, 'Transfer', $6, 'manual', 'transfer', $7)
+       RETURNING id`,
+      [userId, source.id, payload.transferDate, amount, `Transfer ke ${destination.name}`, payload.notes ?? null, payload.receiptId ?? null]
+    );
+    const destinationTransaction = await client.query(
+      `INSERT INTO transactions
+       (user_id, account_id, transaction_type, transaction_date, amount, merchant_name, payment_method, notes, source_type, status, receipt_id)
+       VALUES ($1, $2, 'income', $3, $4, $5, 'Transfer', $6, 'manual', 'transfer', $7)
+       RETURNING id`,
+      [userId, destination.id, payload.transferDate, amount, `Transfer dari ${source.name}`, payload.notes ?? null, payload.receiptId ?? null]
+    );
+    let feeTransactionId: string | null = null;
+    if (Number(feeAmount) > 0) {
+      const feeTransaction = await client.query(
+        `INSERT INTO transactions
+         (user_id, account_id, transaction_type, transaction_date, amount, merchant_name, payment_method, notes, source_type, status)
+         VALUES ($1, $2, 'expense', $3, $4, 'Biaya admin transfer', 'Transfer', $5, 'manual', 'transfer')
+         RETURNING id`,
+        [userId, source.id, payload.transferDate, feeAmount, payload.notes ?? null]
+      );
+      feeTransactionId = feeTransaction.rows[0].id;
+    }
+
+    await writeAuditLog(client, {
+      userId,
+      action: "CREATE",
+      entityName: "Transfer",
+      entityId: transferId,
+      newValue: {
+        ...result.rows[0],
+        feeAmount,
+        receiptId: payload.receiptId ?? null,
+        sourceTransactionId: sourceTransaction.rows[0].id,
+        destinationTransactionId: destinationTransaction.rows[0].id,
+        feeTransactionId
+      }
+    });
+    return { ...result.rows[0], feeAmount };
   });
 }

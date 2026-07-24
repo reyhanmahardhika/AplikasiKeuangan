@@ -2,8 +2,8 @@ import { Router } from "express";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { authRateLimiter } from "../middleware/rateLimit.js";
 import { requireAuth } from "../middleware/auth.js";
-import { changePasswordSchema, loginSchema, registerSchema } from "../validators/schemas.js";
-import { changePassword, getProfile, login, refreshAccessToken, register, revokeRefreshToken } from "../services/authService.js";
+import { changePasswordSchema, loginSchema, profileUpdateSchema, registerSchema, socialLoginSchema } from "../validators/schemas.js";
+import { changePassword, getProfile, login, refreshAccessToken, register, revokeRefreshToken, socialLogin, updateProfile } from "../services/authService.js";
 
 export const authRoutes = Router();
 
@@ -22,6 +22,14 @@ authRoutes.post(
   asyncHandler(async (req, res) => {
     const payload = loginSchema.parse(req.body);
     res.json(await login(payload));
+  })
+);
+
+authRoutes.post(
+  "/social",
+  authRateLimiter,
+  asyncHandler(async (req, res) => {
+    res.json(await socialLogin(socialLoginSchema.parse(req.body)));
   })
 );
 
@@ -53,6 +61,14 @@ authRoutes.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     res.json(await getProfile(req.user!.id));
+  })
+);
+
+authRoutes.put(
+  "/profile",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    res.json(await updateProfile(req.user!.id, profileUpdateSchema.parse(req.body)));
   })
 );
 

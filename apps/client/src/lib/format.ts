@@ -19,3 +19,9 @@ export function localDate(value: string | Date | null | undefined) {
 export function isoDateInput(value = new Date()) {
   return value.toISOString().slice(0, 10);
 }
+
+export function formatRupiahInput(value: string | number | null | undefined) {
+  const raw = String(value ?? "").replace(/[^\d]/g, "");
+  if (!raw) return "";
+  return new Intl.NumberFormat("id-ID").format(Number(raw));
+}

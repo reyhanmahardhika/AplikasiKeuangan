@@ -1,9 +1,19 @@
 import { z } from "zod";
-import { isValidPositiveMoney } from "../utils/money.js";
+import { isValidPositiveMoney, normalizeNonNegativeMoney } from "../utils/money.js";
 
 const uuid = z.string().uuid();
 const money = z.union([z.string(), z.number()]).refine((value) => isValidPositiveMoney(value), {
   message: "Nominal wajib lebih besar dari nol"
+});
+const nonNegativeMoney = z.union([z.string(), z.number()]).refine((value) => {
+  try {
+    normalizeNonNegativeMoney(value);
+    return true;
+  } catch {
+    return false;
+  }
+}, {
+  message: "Nominal tidak boleh negatif"
 });
 
 export const registerSchema = z.object({
@@ -18,10 +28,23 @@ export const loginSchema = z.object({
   password: z.string().min(1)
 });
 
+export const socialLoginSchema = z.object({
+  provider: z.enum(["google", "apple"]),
+  idToken: z.string().min(20),
+  fullName: z.string().min(2).max(160).optional().nullable()
+});
+
+export const profileUpdateSchema = z.object({
+  fullName: z.string().min(2).max(160),
+  nickname: z.string().max(80).optional().nullable(),
+  title: z.string().max(120).optional().nullable(),
+  avatarUrl: z.string().max(900000).optional().nullable()
+});
+
 export const accountSchema = z.object({
   name: z.string().min(2).max(140),
   accountType: z.enum(["cash", "bank", "e_wallet", "credit_card", "other"]),
-  initialBalance: money,
+  initialBalance: nonNegativeMoney,
   currency: z.string().length(3).default("IDR"),
   allowNegative: z.boolean().default(false),
   isActive: z.boolean().default(true)
@@ -64,9 +87,27 @@ export const transferSchema = z.object({
   sourceAccountId: uuid,
   destinationAccountId: uuid,
   amount: money,
+  feeAmount: z.union([z.string(), z.number()]).optional().default(0),
   transferDate: z.string().datetime().or(z.string().date()),
-  notes: z.string().max(2000).optional().nullable()
+  notes: z.string().max(2000).optional().nullable(),
+  receiptId: uuid.optional().nullable()
 });
+
+export const scheduleSchema = z.object({
+  title: z.string().min(2).max(160),
+  scheduleType: z.enum(["transaction", "transfer", "topup"]),
+  dueDay: z.number().int().min(1).max(31),
+  nextDueDate: z.string().date(),
+  amount: money.optional().nullable(),
+  accountId: uuid.optional().nullable(),
+  destinationAccountId: uuid.optional().nullable(),
+  categoryId: uuid.optional().nullable(),
+  paymentMethod: z.string().max(80).optional().nullable(),
+  notes: z.string().max(2000).optional().nullable(),
+  isActive: z.boolean().default(true)
+});
+
+export const scheduleUpdateSchema = scheduleSchema.partial();
 
 export const budgetSchema = z.object({
   categoryId: uuid,
