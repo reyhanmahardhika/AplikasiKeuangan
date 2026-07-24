@@ -1,4 +1,5 @@
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:4000/api";
+const configuredApiUrl = String(import.meta.env.VITE_API_URL ?? "http://localhost:4000/api").trim().replace(/\/+$/, "");
+const API_URL = configuredApiUrl.endsWith("/api") ? configuredApiUrl : `${configuredApiUrl}/api`;
 
 export class ApiError extends Error {
   status: number;
